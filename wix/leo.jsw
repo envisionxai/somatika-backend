@@ -1,0 +1,168 @@
+/**
+ * Wix Velo Backend Module
+ * Интеграция с Somatika AI Platform
+ */
+
+const SERVER_URL = "https://your-server.com";
+
+/**
+ * Отправка сообщения в AI-платформу
+ * @param {string} message - Текст сообщения
+ * @param {string} project - Проект (leo/math/custom)
+ * @param {string} userId - ID пользователя
+ * @returns {Promise<object>} - Ответ сервера
+ */
+export async function sendMessage(message, project, userId) {
+  try {
+    const res = await fetch(`${SERVER_URL}/api/message`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ message, project, userId })
+    });
+
+    if (!res.ok) {
+      throw new Error(`HTTP error: ${res.status}`);
+    }
+
+    return await res.json();
+  } catch (error) {
+    console.error("sendMessage error:", error);
+    throw error;
+  }
+}
+
+/**
+ * Добавление нового патча
+ * @param {object} patch - Объект патча
+ * @returns {Promise<object>} - Ответ сервера
+ */
+export async function addPatch(patch) {
+  try {
+    const res = await fetch(`${SERVER_URL}/api/patch`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(patch)
+    });
+
+    if (!res.ok) {
+      throw new Error(`HTTP error: ${res.status}`);
+    }
+
+    return await res.json();
+  } catch (error) {
+    console.error("addPatch error:", error);
+    throw error;
+  }
+}
+
+/**
+ * Получение всех патчей
+ * @param {string} project - Опционально фильтр по проекту
+ * @returns {Promise<object>} - Список патчей
+ */
+export async function getPatches(project) {
+  try {
+    const url = project 
+      ? `${SERVER_URL}/api/patch?project=${project}`
+      : `${SERVER_URL}/api/patch`;
+
+    const res = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json"
+      }
+    });
+
+    if (!res.ok) {
+      throw new Error(`HTTP error: ${res.status}`);
+    }
+
+    return await res.json();
+  } catch (error) {
+    console.error("getPatches error:", error);
+    throw error;
+  }
+}
+
+/**
+ * Деактивация патча
+ * @param {string} patchId - ID патча
+ * @returns {Promise<object>} - Ответ сервера
+ */
+export async function deactivatePatch(patchId) {
+  try {
+    const res = await fetch(`${SERVER_URL}/api/patch/${patchId}`, {
+      method: "DELETE",
+      headers: {
+        "Content-Type": "application/json"
+      }
+    });
+
+    if (!res.ok) {
+      throw new Error(`HTTP error: ${res.status}`);
+    }
+
+    return await res.json();
+  } catch (error) {
+    console.error("deactivatePatch error:", error);
+    throw error;
+  }
+}
+
+/**
+ * Получение истории сообщений пользователя
+ * @param {string} userId - ID пользователя
+ * @param {string} project - Опционально фильтр по проекту
+ * @param {number} limit - Лимит записей (по умолчанию 50)
+ * @returns {Promise<object>} - История сообщений
+ */
+export async function getMessageHistory(userId, project, limit = 50) {
+  try {
+    let url = `${SERVER_URL}/api/message/history?userId=${userId}&limit=${limit}`;
+    
+    if (project) {
+      url += `&project=${project}`;
+    }
+
+    const res = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json"
+      }
+    });
+
+    if (!res.ok) {
+      throw new Error(`HTTP error: ${res.status}`);
+    }
+
+    return await res.json();
+  } catch (error) {
+    console.error("getMessageHistory error:", error);
+    throw error;
+  }
+}
+
+/**
+ * Проверка доступности сервера
+ * @returns {Promise<object>} - Статус сервера
+ */
+export async function checkHealth() {
+  try {
+    const res = await fetch(`${SERVER_URL}/health`, {
+      method: "GET"
+    });
+
+    if (!res.ok) {
+      throw new Error(`HTTP error: ${res.status}`);
+    }
+
+    return await res.json();
+  } catch (error) {
+    console.error("checkHealth error:", error);
+    throw error;
+  }
+}
