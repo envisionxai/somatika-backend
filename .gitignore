@@ -3,3 +3,4 @@ node_modules/
 *.log
 somatika.db
 server.js.backup
+CLAUDE.md

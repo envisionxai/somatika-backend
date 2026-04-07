@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const fetch = require("node-fetch");
+const { executeAllFileActions } = require("../engine/fileActions");
 
 const STORAGE_PATH = path.join(__dirname, "..", "storage");
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
@@ -33,7 +34,7 @@ function scanStorageStructure() {
   return structure;
 }
 
-function buildArchitectPrompt() {
+function buildArchitectPrompt(userId, memoryContext) {
   const core = readFolder("core");
   const protocols = readFolder("protocols");
   const scenarios = readFolder("scenarios");
@@ -43,22 +44,45 @@ function buildArchitectPrompt() {
     .map(([folder, files]) => folder + "/\n" + files.map(f => "  - " + f).join("\n"))
     .join("\n\n");
 
-  return "=== SYSTEM INFO ===\nServer: active\nMode: architect\nStorage structure:\n\n" + structureText + "\n\n=== SYSTEM FILES ===\n\n" + core + "\n\n" + protocols + "\n\n" + scenarios + "\n\n" + patches + "\n\n=== ROLE ===\nTy — Architector. Glavnyj upravljajushchij AI-modul sistemy.\nTy imeesh dostup ko vsem fajlam sistemy. Ty vidish strukturu storage.\nPo umolchaniju ty rabotaesh kak upravljajushchij centr: analiziruesh, upravljaesh, sozdajosh patchi.\nPo prjamoj komande vladeltsa mozhesh vremenno perejti v rezhim assistenta.\nPosle vypolnenija zadachi vozvrashaeshsja v rezhim Architekta.\n\nEsli nuzhno sozdat ili izmenit fajl — ispolzuj format:\n[MODE: FILE]\nNAME: imja_fajla\nCONTENT:\n...soderzhimoe...\n[END FILE]";
-}
+  let prompt = "=== SYSTEM INFO ===\nServer: active\nMode: architect\nStorage structure:\n\n" + structureText;
+  prompt += "\n\n=== SYSTEM FILES ===\n\n" + core + "\n\n" + protocols + "\n\n" + scenarios + "\n\n" + patches;
 
-function parseFileFromReply(reply) {
-  const fileRegex = /\[MODE:\s*(?:FILE|PATCH)\]\s*\n\s*NAME:\s*(.+)\s*\n\s*CONTENT:\s*\n([\s\S]*?)\[END\s*(?:FILE|PATCH)\]/gi;
-  const files = [];
-  let match;
-  while ((match = fileRegex.exec(reply)) !== null) {
-    files.push({ name: match[1].trim(), content: match[2].trim() });
+  // Блок памяти (если есть)
+  if (memoryContext) {
+    if (memoryContext.ownerProfile) {
+      prompt += "\n\n=== OWNER PROFILE ===\n" + memoryContext.ownerProfile;
+    }
+    if (memoryContext.semanticMemory) {
+      prompt += "\n\n=== USER MEMORY ===\n" + memoryContext.semanticMemory;
+    }
+    if (memoryContext.recentHistory) {
+      prompt += "\n\n=== RECENT HISTORY ===\n" + memoryContext.recentHistory;
+    }
   }
-  return files;
+
+  prompt += "\n\n=== ROLE ===\n";
+  prompt += "Ты — Архитектор. Главный управляющий AI-модуль системы.\n";
+  prompt += "Ты имеешь доступ ко всем файлам системы. Ты видишь структуру storage.\n";
+  prompt += "По умолчанию ты работаешь как управляющий центр: анализируешь, управляешь, создаёшь патчи.\n";
+  prompt += "По прямой команде владельца можешь временно перейти в режим ассистента.\n";
+  prompt += "После выполнения задачи возвращаешься в режим Архитектора.\n\n";
+  prompt += "=== FILE OPERATIONS ===\n";
+  prompt += "Для работы с файлами используй формат:\n\n";
+  prompt += "[MODE: FILE]\nACTION: CREATE | UPDATE | DELETE | MOVE | RENAME\nNAME: имя_файла\nCONTENT:\n...содержимое...\n[END FILE]\n\n";
+  prompt += "ACTION по умолчанию: CREATE\n";
+  prompt += "Для MOVE/RENAME используй FROM: и TO:\n";
+  prompt += "Разрешённые папки: patches, protocols, scenarios, misc, memory\n";
+  prompt += "Папка core — только обновление, не удаление.\n";
+  prompt += "Для опасных действий (DELETE, массовые изменения) — сначала предложи, жди подтверждения.\n";
+
+  return prompt;
 }
 
-async function runArchitect(userMessage) {
+// parseFileFromReply заменён на executeAllFileActions из engine/fileActions.js
+
+async function runArchitect(userMessage, userId, memoryContext) {
   const apiKey = process.env.OPENAI_API_KEY;
-  const systemPrompt = buildArchitectPrompt();
+  const systemPrompt = buildArchitectPrompt(userId, memoryContext);
 
   const response = await fetch(OPENAI_API_URL, {
     method: "POST",
@@ -85,23 +109,19 @@ async function runArchitect(userMessage) {
   const data = await response.json();
   const reply = data.choices[0].message.content;
 
-  const filesToSave = parseFileFromReply(reply);
-  const savedFiles = [];
+  // Выполняем все файловые операции из ответа AI (CREATE/UPDATE/DELETE/MOVE/RENAME)
+  const fileResults = executeAllFileActions(reply);
+  const savedFiles = fileResults.filter(r => r.success);
+  const failedFiles = fileResults.filter(r => !r.success);
 
-  if (filesToSave.length > 0) {
-    const { saveFile } = require("../engine/fileManager");
-    for (const file of filesToSave) {
-      try {
-        const result = saveFile(file.name, file.content);
-        savedFiles.push(result);
-        console.log("Architect created file: " + file.name);
-      } catch (err) {
-        console.error("Architect file save error: " + file.name, err);
-      }
-    }
+  if (savedFiles.length > 0) {
+    console.log(`Architect file operations: ${savedFiles.length} succeeded`);
+  }
+  if (failedFiles.length > 0) {
+    console.warn(`Architect file operations: ${failedFiles.length} failed`, failedFiles);
   }
 
-  return { reply, savedFiles };
+  return { reply, savedFiles, failedFiles };
 }
 
 module.exports = { runArchitect };
