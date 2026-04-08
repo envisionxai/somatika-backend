@@ -4,3 +4,5 @@ node_modules/
 somatika.db
 server.js.backup
 CLAUDE.md
+architect.js
+chatwidget.html

@@ -34,11 +34,30 @@ function scanStorageStructure() {
   return structure;
 }
 
+function readFolderLimited(folderName, maxTotalChars) {
+  const folderPath = path.join(STORAGE_PATH, folderName);
+  if (!fs.existsSync(folderPath)) return "";
+  const files = fs.readdirSync(folderPath).filter(f => f.endsWith(".txt")).sort();
+  let total = 0;
+  const parts = [];
+  for (const f of files) {
+    const content = fs.readFileSync(path.join(folderPath, f), "utf-8");
+    if (total + content.length > maxTotalChars) {
+      parts.push("--- " + f + " ---\n" + content.substring(0, maxTotalChars - total) + "\n[...обрезано]");
+      break;
+    }
+    parts.push("--- " + f + " ---\n" + content);
+    total += content.length;
+  }
+  return parts.join("\n\n");
+}
+
 function buildArchitectPrompt(userId, memoryContext) {
   const core = readFolder("core");
   const protocols = readFolder("protocols");
   const scenarios = readFolder("scenarios");
   const patches = readFolder("patches");
+  const misc = readFolderLimited("misc", 10000);
   const storageStructure = scanStorageStructure();
   const structureText = Object.entries(storageStructure)
     .map(([folder, files]) => folder + "/\n" + files.map(f => "  - " + f).join("\n"))
@@ -46,6 +65,9 @@ function buildArchitectPrompt(userId, memoryContext) {
 
   let prompt = "=== SYSTEM INFO ===\nServer: active\nMode: architect\nStorage structure:\n\n" + structureText;
   prompt += "\n\n=== SYSTEM FILES ===\n\n" + core + "\n\n" + protocols + "\n\n" + scenarios + "\n\n" + patches;
+  if (misc) {
+    prompt += "\n\n=== UPLOADED FILES (misc/) ===\n\n" + misc;
+  }
 
   // Блок памяти (если есть)
   if (memoryContext) {
@@ -62,7 +84,8 @@ function buildArchitectPrompt(userId, memoryContext) {
 
   prompt += "\n\n=== ROLE ===\n";
   prompt += "Ты — Архитектор. Главный управляющий AI-модуль системы.\n";
-  prompt += "Ты имеешь доступ ко всем файлам системы. Ты видишь структуру storage.\n";
+  prompt += "Ты имеешь доступ ко всем файлам системы. Ты видишь структуру storage и содержимое файлов.\n";
+  prompt += "Загруженные пользователем файлы находятся в misc/. Их содержимое доступно тебе в секции UPLOADED FILES.\n";
   prompt += "По умолчанию ты работаешь как управляющий центр: анализируешь, управляешь, создаёшь патчи.\n";
   prompt += "По прямой команде владельца можешь временно перейти в режим ассистента.\n";
   prompt += "После выполнения задачи возвращаешься в режим Архитектора.\n\n";
