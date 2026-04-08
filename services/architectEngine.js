@@ -14,7 +14,7 @@ function readFolder(folderName) {
 }
 
 function scanStorageStructure() {
-  const folders = ["core", "protocols", "scenarios", "patches", "misc"];
+  const folders = ["core", "protocols", "scenarios", "patches", "misc", "projects"];
   const structure = {};
   for (const folder of folders) {
     const folderPath = path.join(STORAGE_PATH, folder);

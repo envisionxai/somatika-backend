@@ -50,10 +50,10 @@ function determineFileType(name) {
     return { folder: 'core' };
   }
 
-  // Приоритет 5: PROJECT
-  if (upperName.includes('PROJECT') || 
-      upperName.includes('LEO') || 
-      upperName.includes('MATH')) {
+  // Приоритет 5: PROJECT (только если имя начинается с ключевого слова)
+  if (upperName.startsWith('PROJECT') ||
+      upperName.startsWith('LEO_') ||
+      upperName.startsWith('MATH_')) {
     return { folder: 'projects' };
   }
 
