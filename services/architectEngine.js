@@ -63,6 +63,8 @@ function buildArchitectPrompt(userId, memoryContext) {
     .map(([folder, files]) => folder + "/\n" + files.map(f => "  - " + f).join("\n"))
     .join("\n\n");
 
+  console.log("📂 Storage structure:", JSON.stringify(storageStructure, null, 2));
+
   let prompt = "=== SYSTEM INFO ===\nServer: active\nMode: architect\nStorage structure:\n\n" + structureText;
   prompt += "\n\n=== SYSTEM FILES ===\n\n" + core + "\n\n" + protocols + "\n\n" + scenarios + "\n\n" + patches;
   if (misc) {
