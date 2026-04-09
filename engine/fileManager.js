@@ -26,18 +26,20 @@ function ensureDirectory(dirPath) {
  */
 function saveFile(name, content) {
   try {
-    // Получить полный путь
+    // Получить полный путь к файлу
     const fullPath = getFullPath(name);
-    const dirPath = getStoragePath(name);
-    
-    // Убедиться, что директория существует
+    // Директория вычисляется из полного пути — это корректно работает
+    // и для автороутинга, и для явно указанных путей (misc/sub/file.txt)
+    const dirPath = path.dirname(fullPath);
+
+    // Убедиться, что директория существует (включая промежуточные)
     ensureDirectory(dirPath);
-    
+
     // Записать файл
     fs.writeFileSync(fullPath, content, 'utf8');
-    
+
     console.log(`💾 File saved: ${name} → ${fullPath}`);
-    
+
     return {
       success: true,
       name,
