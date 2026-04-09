@@ -107,6 +107,27 @@ function checkPermission(name, action) {
 }
 
 /**
+ * Нормализация пути, присланного AI:
+ * - убирает ведущие слеши/бэкслеши (/misc/foo → misc/foo)
+ * - убирает обрамляющие кавычки и бэктики
+ * - убирает префикс storage/ (storage/misc/foo → misc/foo)
+ * @param {string|null} raw
+ * @returns {string|null}
+ */
+function normalizeRelativePath(raw) {
+  if (raw === null || raw === undefined) return null;
+  let s = String(raw).trim();
+  if (!s) return s;
+  // Убрать обрамляющие кавычки
+  s = s.replace(/^["'`]+|["'`]+$/g, "").trim();
+  // Убрать ведущие слеши/бэкслеши
+  s = s.replace(/^[\\/]+/, "");
+  // Убрать префикс storage/
+  s = s.replace(/^storage[\\/]+/i, "");
+  return s;
+}
+
+/**
  * Парсинг одного [MODE: FILE] блока с поддержкой ACTION
  * @param {string} block — текст блока
  * @returns {object|null} — { action, name, path, content, from, to, force }
@@ -117,8 +138,8 @@ function parseSingleBlock(block) {
 
   const nameMatch = block.match(/NAME:\s*([^\n]+)/);
   const pathMatch = block.match(/PATH:\s*([^\n]+)/i);
-  const name = nameMatch ? nameMatch[1].trim() : null;
-  const pathValue = pathMatch ? pathMatch[1].trim() : null;
+  const name = normalizeRelativePath(nameMatch ? nameMatch[1] : null);
+  const pathValue = normalizeRelativePath(pathMatch ? pathMatch[1] : null);
 
   // Для файловых операций требуется NAME. Для операций над папками — PATH или NAME.
   // Операциям MOVE/RENAME/MOVE_DIR/RENAME_DIR хватает FROM/TO.
@@ -151,8 +172,8 @@ function parseSingleBlock(block) {
     name: name || pathValue,
     path: pathValue || name,
     content,
-    from: fromMatch ? fromMatch[1].trim() : null,
-    to: toMatch ? toMatch[1].trim() : null,
+    from: normalizeRelativePath(fromMatch ? fromMatch[1] : null),
+    to: normalizeRelativePath(toMatch ? toMatch[1] : null),
     force
   };
 }
@@ -202,8 +223,12 @@ function parseFileMessage(text) {
  * @returns {{ success: boolean, action: string, name: string, error?: string }}
  */
 function executeFileAction(fileOp) {
-  const { action, name, content, from, to, force } = fileOp;
-  const targetPath = fileOp.path || name;
+  const { action, content, force } = fileOp;
+  // Нормализация всех путей — страхуемся на случай прямого вызова в обход парсера
+  const name = normalizeRelativePath(fileOp.name);
+  const from = normalizeRelativePath(fileOp.from);
+  const to = normalizeRelativePath(fileOp.to);
+  const targetPath = normalizeRelativePath(fileOp.path) || name;
 
   switch (action) {
     case "CREATE":

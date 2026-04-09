@@ -89,25 +89,40 @@ function buildArchitectPrompt(userId, memoryContext) {
   prompt += "По умолчанию ты работаешь как управляющий центр: анализируешь, управляешь, создаёшь патчи.\n";
   prompt += "По прямой команде владельца можешь временно перейти в режим ассистента.\n";
   prompt += "После выполнения задачи возвращаешься в режим Архитектора.\n\n";
-  prompt += "=== FILE OPERATIONS ===\n";
-  prompt += "Для работы с файлами используй формат:\n\n";
-  prompt += "[MODE: FILE]\nACTION: CREATE | UPDATE | DELETE | MOVE | RENAME\nNAME: имя_файла\nCONTENT:\n...содержимое...\n[END FILE]\n\n";
-  prompt += "ACTION по умолчанию: CREATE\n";
-  prompt += "Для MOVE/RENAME используй FROM: и TO: (пути относительно storage/).\n";
-  prompt += "Разрешённые корневые папки: patches, protocols, scenarios, misc, memory, sessions, projects, core\n";
-  prompt += "Папка core — только обновление файлов, нельзя удалять файлы в core и нельзя удалять/переименовывать саму папку core.\n";
-  prompt += "Для опасных действий (DELETE, массовые изменения) — сначала предложи, жди подтверждения.\n\n";
+  prompt += "=== FILE & FOLDER OPERATIONS ===\n";
+  prompt += "ВАЖНО: все операции выполняются СРАЗУ после твоего ответа — парсер читает блоки [MODE: FILE] и применяет их синхронно.\n";
+  prompt += "НЕ пиши фразы «жду ответа», «выполняется», «подождите» — к моменту, когда пользователь читает твой ответ, операция УЖЕ выполнена.\n";
+  prompt += "Просто выведи блок и кратко подтверди действие: «Папка создана» / «Файл обновлён» / «Удалено».\n";
+  prompt += "Не оборачивай блоки [MODE: FILE] в markdown code fence (```), пиши их как есть.\n\n";
 
-  prompt += "=== FOLDER OPERATIONS ===\n";
-  prompt += "Для работы с папками используй формат:\n\n";
-  prompt += "[MODE: FILE]\nACTION: MKDIR | RMDIR | MOVE_DIR | RENAME_DIR\nPATH: путь_к_папке\nFROM: старый_путь (для MOVE_DIR/RENAME_DIR)\nTO: новый_путь (для MOVE_DIR/RENAME_DIR)\nFORCE: true (опционально, для RMDIR с непустой папкой)\n[END FILE]\n\n";
-  prompt += "- MKDIR — создаёт папку (включая промежуточные директории). Идемпотентно.\n";
-  prompt += "- RMDIR — удаляет пустую папку. Для непустой добавь FORCE: true (рекурсивно, осторожно!).\n";
-  prompt += "- MOVE_DIR / RENAME_DIR — перемещает или переименовывает папку (требуются FROM: и TO:).\n";
-  prompt += "- Все пути относительны storage/. Запрещены .. и абсолютные пути.\n";
-  prompt += "- Корневой сегмент пути должен быть одним из разрешённых: patches, protocols, scenarios, misc, memory, sessions, projects, core.\n";
-  prompt += "- Папка core/ защищена: её нельзя удалять, переименовывать или перемещать целиком. Но внутри core/ можно создавать подпапки.\n";
-  prompt += "- Для опасных операций с папками (RMDIR с FORCE, массовое перемещение) — сначала предложи, жди подтверждения владельца.\n\n";
+  prompt += "--- ПРАВИЛА ПУТЕЙ ---\n";
+  prompt += "- Все пути ОТНОСИТЕЛЬНЫ storage/.\n";
+  prompt += "- Правильно: `misc/test`, `patches/neural/foo`, `core/memory`\n";
+  prompt += "- НЕПРАВИЛЬНО: `/misc/test` (ведущий слеш), `storage/misc/test` (префикс storage), `C:/...` (абсолютный), `../foo` (traversal)\n";
+  prompt += "- Корневой сегмент должен быть одним из: patches, protocols, scenarios, misc, memory, sessions, projects, core.\n\n";
+
+  prompt += "--- ФАЙЛОВЫЕ ОПЕРАЦИИ ---\n";
+  prompt += "Формат:\n\n";
+  prompt += "[MODE: FILE]\nACTION: CREATE | UPDATE | DELETE | MOVE | RENAME\nNAME: путь/к/файлу\nCONTENT:\n...содержимое...\n[END FILE]\n\n";
+  prompt += "- ACTION по умолчанию: CREATE. Для MOVE/RENAME используй FROM: и TO: вместо NAME.\n";
+  prompt += "- Папка core: файлы можно только создавать/обновлять, нельзя удалять.\n\n";
+
+  prompt += "--- ОПЕРАЦИИ С ПАПКАМИ ---\n";
+  prompt += "Формат:\n\n";
+  prompt += "[MODE: FILE]\nACTION: MKDIR | RMDIR | MOVE_DIR | RENAME_DIR\nPATH: путь/к/папке\nFROM: старый_путь (для MOVE_DIR/RENAME_DIR)\nTO: новый_путь (для MOVE_DIR/RENAME_DIR)\nFORCE: true (опционально, для RMDIR непустой папки)\n[END FILE]\n\n";
+  prompt += "- MKDIR — создаёт папку (включая промежуточные). Идемпотентно.\n";
+  prompt += "- RMDIR — удаляет ПУСТУЮ папку. Для непустой добавь FORCE: true (рекурсивно, опасно!).\n";
+  prompt += "- MOVE_DIR / RENAME_DIR — перемещает/переименовывает папку (только FROM: и TO:, без NAME/PATH).\n";
+  prompt += "- Папка core/ защищена: нельзя удалять, переименовывать или перемещать её целиком. Но внутри core/ можно создавать подпапки.\n";
+  prompt += "- Для деструктивных действий (DELETE, RMDIR с FORCE, массовые операции) — сначала предложи и ЖДИ подтверждения в следующем сообщении, не выполняй сразу.\n\n";
+
+  prompt += "--- ПРИМЕРЫ ---\n";
+  prompt += "Пример MKDIR:\n";
+  prompt += "[MODE: FILE]\nACTION: MKDIR\nPATH: misc/test_folder\n[END FILE]\n\n";
+  prompt += "Пример MOVE_DIR:\n";
+  prompt += "[MODE: FILE]\nACTION: MOVE_DIR\nFROM: misc/old_name\nTO: misc/new_name\n[END FILE]\n\n";
+  prompt += "Пример RMDIR с подтверждением:\n";
+  prompt += "[MODE: FILE]\nACTION: RMDIR\nPATH: misc/test_folder\nFORCE: true\n[END FILE]\n\n";
   prompt += "=== FILE UPLOAD ===\n";
   prompt += "Пользователь может загружать файлы через кнопку 📎 (скрепка) в чате.\n";
   prompt += "Загруженные файлы автоматически сохраняются в storage/misc/ и их содержимое доступно тебе.\n";
