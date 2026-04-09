@@ -63,8 +63,6 @@ function buildArchitectPrompt(userId, memoryContext) {
     .map(([folder, files]) => folder + "/\n" + files.map(f => "  - " + f).join("\n"))
     .join("\n\n");
 
-  console.log("📂 Storage structure:", JSON.stringify(storageStructure, null, 2));
-
   let prompt = "=== SYSTEM INFO ===\nServer: active\nMode: architect\nStorage structure:\n\n" + structureText;
   prompt += "\n\n=== SYSTEM FILES ===\n\n" + core + "\n\n" + protocols + "\n\n" + scenarios + "\n\n" + patches;
   if (misc) {
@@ -95,10 +93,21 @@ function buildArchitectPrompt(userId, memoryContext) {
   prompt += "Для работы с файлами используй формат:\n\n";
   prompt += "[MODE: FILE]\nACTION: CREATE | UPDATE | DELETE | MOVE | RENAME\nNAME: имя_файла\nCONTENT:\n...содержимое...\n[END FILE]\n\n";
   prompt += "ACTION по умолчанию: CREATE\n";
-  prompt += "Для MOVE/RENAME используй FROM: и TO:\n";
-  prompt += "Разрешённые папки: patches, protocols, scenarios, misc, memory\n";
-  prompt += "Папка core — только обновление, не удаление.\n";
+  prompt += "Для MOVE/RENAME используй FROM: и TO: (пути относительно storage/).\n";
+  prompt += "Разрешённые корневые папки: patches, protocols, scenarios, misc, memory, sessions, projects, core\n";
+  prompt += "Папка core — только обновление файлов, нельзя удалять файлы в core и нельзя удалять/переименовывать саму папку core.\n";
   prompt += "Для опасных действий (DELETE, массовые изменения) — сначала предложи, жди подтверждения.\n\n";
+
+  prompt += "=== FOLDER OPERATIONS ===\n";
+  prompt += "Для работы с папками используй формат:\n\n";
+  prompt += "[MODE: FILE]\nACTION: MKDIR | RMDIR | MOVE_DIR | RENAME_DIR\nPATH: путь_к_папке\nFROM: старый_путь (для MOVE_DIR/RENAME_DIR)\nTO: новый_путь (для MOVE_DIR/RENAME_DIR)\nFORCE: true (опционально, для RMDIR с непустой папкой)\n[END FILE]\n\n";
+  prompt += "- MKDIR — создаёт папку (включая промежуточные директории). Идемпотентно.\n";
+  prompt += "- RMDIR — удаляет пустую папку. Для непустой добавь FORCE: true (рекурсивно, осторожно!).\n";
+  prompt += "- MOVE_DIR / RENAME_DIR — перемещает или переименовывает папку (требуются FROM: и TO:).\n";
+  prompt += "- Все пути относительны storage/. Запрещены .. и абсолютные пути.\n";
+  prompt += "- Корневой сегмент пути должен быть одним из разрешённых: patches, protocols, scenarios, misc, memory, sessions, projects, core.\n";
+  prompt += "- Папка core/ защищена: её нельзя удалять, переименовывать или перемещать целиком. Но внутри core/ можно создавать подпапки.\n";
+  prompt += "- Для опасных операций с папками (RMDIR с FORCE, массовое перемещение) — сначала предложи, жди подтверждения владельца.\n\n";
   prompt += "=== FILE UPLOAD ===\n";
   prompt += "Пользователь может загружать файлы через кнопку 📎 (скрепка) в чате.\n";
   prompt += "Загруженные файлы автоматически сохраняются в storage/misc/ и их содержимое доступно тебе.\n";

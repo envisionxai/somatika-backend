@@ -1,6 +1,7 @@
 /**
  * File Actions — Универсальный парсер и исполнитель файловых операций
- * Поддержка: CREATE, UPDATE, DELETE, MOVE, RENAME
+ * Поддержка файлов: CREATE, UPDATE, DELETE, MOVE, RENAME
+ * Поддержка папок: MKDIR, RMDIR, MOVE_DIR, RENAME_DIR
  */
 
 const fs = require("fs");
@@ -8,9 +9,12 @@ const path = require("path");
 const { saveFile, deleteFile } = require("./fileManager");
 const { STORAGE_BASE } = require("./fileRouter");
 
-// Разрешённые папки для операций
-const ALLOWED_FOLDERS = ["patches", "protocols", "scenarios", "misc", "memory", "sessions"];
-const RESTRICTED_FOLDERS = ["core"]; // только чтение
+// Разрешённые корневые папки для операций (файлы и подпапки)
+const ALLOWED_FOLDERS = ["patches", "protocols", "scenarios", "misc", "memory", "sessions", "projects"];
+// Корневые папки, которые нельзя удалять/переименовывать/перемещать целиком,
+// но внутрь которых можно писать (core содержит системные файлы архитектора)
+const PROTECTED_ROOT_FOLDERS = ["core"];
+const RESTRICTED_FOLDERS = ["core"]; // legacy: только чтение для DELETE файлов
 
 /**
  * Валидация пути — запрет выхода за storage/
@@ -23,6 +27,63 @@ function isPathSafe(filePath) {
   if (normalized.includes("..")) return false;
   if (path.isAbsolute(normalized)) return false;
   return true;
+}
+
+/**
+ * Валидация пути папки — расширение isPathSafe для директорий
+ * @param {string} folderPath — путь к папке относительно storage/
+ * @returns {boolean}
+ */
+function isFolderPathSafe(folderPath) {
+  if (!isPathSafe(folderPath)) return false;
+  const normalized = path.normalize(folderPath).replace(/[\\/]+$/, "");
+  if (!normalized) return false;
+  if (normalized === "." || normalized === "/") return false;
+  return true;
+}
+
+/**
+ * Первый сегмент пути (корневая папка в storage/)
+ * @param {string} relative
+ * @returns {string}
+ */
+function firstSegment(relative) {
+  const normalized = path.normalize(relative).replace(/[\\/]+$/, "");
+  const parts = normalized.split(/[\\/]/);
+  return parts[0] || "";
+}
+
+/**
+ * Проверка, что путь находится под одной из разрешённых корневых папок
+ * (ALLOWED_FOLDERS или PROTECTED_ROOT_FOLDERS — внутрь protected писать можно)
+ * @param {string} relative
+ * @returns {boolean}
+ */
+function isWithinAllowedRoot(relative) {
+  const root = firstSegment(relative);
+  return ALLOWED_FOLDERS.includes(root) || PROTECTED_ROOT_FOLDERS.includes(root);
+}
+
+/**
+ * Проверка, что путь указывает именно на защищённую корневую папку целиком
+ * (например, "core" или "core/" — но НЕ "core/subfolder")
+ * @param {string} relative
+ * @returns {boolean}
+ */
+function isProtectedFolder(relative) {
+  if (!relative) return false;
+  const normalized = path.normalize(relative).replace(/[\\/]+$/, "");
+  return PROTECTED_ROOT_FOLDERS.includes(normalized);
+}
+
+/**
+ * Построить абсолютный путь папки внутри storage/
+ * @param {string} relative
+ * @returns {string}
+ */
+function resolveFolderPath(relative) {
+  const normalized = path.normalize(relative).replace(/[\\/]+$/, "");
+  return path.join(STORAGE_BASE, normalized);
 }
 
 /**
@@ -48,18 +109,26 @@ function checkPermission(name, action) {
 /**
  * Парсинг одного [MODE: FILE] блока с поддержкой ACTION
  * @param {string} block — текст блока
- * @returns {object|null} — { action, name, content, from, to }
+ * @returns {object|null} — { action, name, path, content, from, to, force }
  */
 function parseSingleBlock(block) {
-  const nameMatch = block.match(/NAME:\s*([^\n]+)/);
-  if (!nameMatch) return null;
-
-  const name = nameMatch[1].trim();
   const actionMatch = block.match(/ACTION:\s*([^\n]+)/i);
   const action = actionMatch ? actionMatch[1].trim().toUpperCase() : "CREATE";
 
+  const nameMatch = block.match(/NAME:\s*([^\n]+)/);
+  const pathMatch = block.match(/PATH:\s*([^\n]+)/i);
+  const name = nameMatch ? nameMatch[1].trim() : null;
+  const pathValue = pathMatch ? pathMatch[1].trim() : null;
+
+  // Для файловых операций требуется NAME. Для операций над папками — PATH или NAME.
+  // Операциям MOVE/RENAME/MOVE_DIR/RENAME_DIR хватает FROM/TO.
+  const isMoveLike = action === "MOVE" || action === "RENAME" || action === "MOVE_DIR" || action === "RENAME_DIR";
+  if (!name && !pathValue && !isMoveLike) return null;
+
   const fromMatch = block.match(/FROM:\s*([^\n]+)/i);
   const toMatch = block.match(/TO:\s*([^\n]+)/i);
+  const forceMatch = block.match(/FORCE:\s*([^\n]+)/i);
+  const force = forceMatch ? /^(true|1|yes)$/i.test(forceMatch[1].trim()) : false;
 
   let content = null;
   const contentStart = block.indexOf("CONTENT:");
@@ -79,10 +148,12 @@ function parseSingleBlock(block) {
 
   return {
     action,
-    name,
+    name: name || pathValue,
+    path: pathValue || name,
     content,
     from: fromMatch ? fromMatch[1].trim() : null,
-    to: toMatch ? toMatch[1].trim() : null
+    to: toMatch ? toMatch[1].trim() : null,
+    force
   };
 }
 
@@ -127,26 +198,23 @@ function parseFileMessage(text) {
 
 /**
  * Выполнение файловой операции
- * @param {object} fileOp — распарсенный блок { action, name, content, from, to }
+ * @param {object} fileOp — распарсенный блок { action, name, path, content, from, to, force }
  * @returns {{ success: boolean, action: string, name: string, error?: string }}
  */
 function executeFileAction(fileOp) {
-  const { action, name, content, from, to } = fileOp;
-
-  // Валидация пути
-  if (!isPathSafe(name)) {
-    return { success: false, action, name, error: "Unsafe path" };
-  }
-
-  // Проверка разрешений
-  const perm = checkPermission(name, action);
-  if (!perm.allowed) {
-    return { success: false, action, name, error: perm.reason };
-  }
+  const { action, name, content, from, to, force } = fileOp;
+  const targetPath = fileOp.path || name;
 
   switch (action) {
     case "CREATE":
     case "UPDATE": {
+      if (!isPathSafe(name)) {
+        return { success: false, action, name, error: "Unsafe path" };
+      }
+      const perm = checkPermission(name, action);
+      if (!perm.allowed) {
+        return { success: false, action, name, error: perm.reason };
+      }
       if (!content) {
         return { success: false, action, name, error: "No content provided" };
       }
@@ -155,6 +223,13 @@ function executeFileAction(fileOp) {
     }
 
     case "DELETE": {
+      if (!isPathSafe(name)) {
+        return { success: false, action, name, error: "Unsafe path" };
+      }
+      const perm = checkPermission(name, action);
+      if (!perm.allowed) {
+        return { success: false, action, name, error: perm.reason };
+      }
       const deleted = deleteFile(name);
       if (!deleted) {
         return { success: false, action, name, error: "File not found" };
@@ -173,9 +248,147 @@ function executeFileAction(fileOp) {
       return moveFile(from, to);
     }
 
+    case "MKDIR":
+      return mkdirAction(targetPath);
+
+    case "RMDIR":
+      return rmdirAction(targetPath, force);
+
+    case "MOVE_DIR":
+    case "RENAME_DIR":
+      return moveDirAction(from, to, action);
+
     default:
       return { success: false, action, name, error: `Unknown action: ${action}` };
   }
+}
+
+/**
+ * Создание папки (рекурсивно, идемпотентно)
+ * @param {string} relative — путь относительно storage/
+ */
+function mkdirAction(relative) {
+  if (!isFolderPathSafe(relative)) {
+    return { success: false, action: "MKDIR", name: relative, error: "Unsafe folder path" };
+  }
+  if (!isWithinAllowedRoot(relative)) {
+    return {
+      success: false,
+      action: "MKDIR",
+      name: relative,
+      error: `Root folder must be one of: ${ALLOWED_FOLDERS.concat(PROTECTED_ROOT_FOLDERS).join(", ")}`
+    };
+  }
+
+  const absPath = resolveFolderPath(relative);
+  const existed = fs.existsSync(absPath);
+
+  try {
+    fs.mkdirSync(absPath, { recursive: true });
+  } catch (error) {
+    return { success: false, action: "MKDIR", name: relative, error: error.message };
+  }
+
+  console.log(`📁 Folder ${existed ? "exists" : "created"}: ${relative}`);
+  return { success: true, action: "MKDIR", name: relative, path: absPath, existed };
+}
+
+/**
+ * Удаление папки. По умолчанию только пустой; с force=true — рекурсивно.
+ * @param {string} relative
+ * @param {boolean} force
+ */
+function rmdirAction(relative, force) {
+  if (!isFolderPathSafe(relative)) {
+    return { success: false, action: "RMDIR", name: relative, error: "Unsafe folder path" };
+  }
+  if (!isWithinAllowedRoot(relative)) {
+    return { success: false, action: "RMDIR", name: relative, error: "Folder outside allowed roots" };
+  }
+  if (isProtectedFolder(relative)) {
+    return { success: false, action: "RMDIR", name: relative, error: "Protected folder: cannot delete root folder" };
+  }
+
+  const absPath = resolveFolderPath(relative);
+  if (!fs.existsSync(absPath)) {
+    return { success: false, action: "RMDIR", name: relative, error: "Folder not found" };
+  }
+
+  const stats = fs.statSync(absPath);
+  if (!stats.isDirectory()) {
+    return { success: false, action: "RMDIR", name: relative, error: "Path is not a directory" };
+  }
+
+  const entries = fs.readdirSync(absPath);
+  const isEmpty = entries.length === 0;
+
+  try {
+    if (isEmpty) {
+      fs.rmdirSync(absPath);
+    } else if (force === true) {
+      fs.rmSync(absPath, { recursive: true, force: true });
+    } else {
+      return {
+        success: false,
+        action: "RMDIR",
+        name: relative,
+        error: "Folder not empty, use FORCE: true for recursive delete"
+      };
+    }
+  } catch (error) {
+    return { success: false, action: "RMDIR", name: relative, error: error.message };
+  }
+
+  console.log(`🗑️ Folder removed${force ? " (recursive)" : ""}: ${relative}`);
+  return { success: true, action: "RMDIR", name: relative, recursive: force === true };
+}
+
+/**
+ * Перемещение / переименование папки
+ * @param {string} fromRelative
+ * @param {string} toRelative
+ * @param {string} action — "MOVE_DIR" или "RENAME_DIR"
+ */
+function moveDirAction(fromRelative, toRelative, action) {
+  if (!fromRelative || !toRelative) {
+    return { success: false, action, name: fromRelative, error: "FROM and TO required" };
+  }
+  if (!isFolderPathSafe(fromRelative) || !isFolderPathSafe(toRelative)) {
+    return { success: false, action, name: fromRelative, error: "Unsafe folder path in FROM/TO" };
+  }
+  if (!isWithinAllowedRoot(fromRelative) || !isWithinAllowedRoot(toRelative)) {
+    return { success: false, action, name: fromRelative, error: "Folder outside allowed roots" };
+  }
+  if (isProtectedFolder(fromRelative) || isProtectedFolder(toRelative)) {
+    return { success: false, action, name: fromRelative, error: "Protected folder: cannot move/rename root folder" };
+  }
+
+  const fromAbs = resolveFolderPath(fromRelative);
+  const toAbs = resolveFolderPath(toRelative);
+
+  if (!fs.existsSync(fromAbs)) {
+    return { success: false, action, name: fromRelative, error: "Source folder not found" };
+  }
+  const stats = fs.statSync(fromAbs);
+  if (!stats.isDirectory()) {
+    return { success: false, action, name: fromRelative, error: "Source path is not a directory" };
+  }
+  if (fs.existsSync(toAbs)) {
+    return { success: false, action, name: fromRelative, error: "Target already exists" };
+  }
+
+  try {
+    const parentDir = path.dirname(toAbs);
+    if (!fs.existsSync(parentDir)) {
+      fs.mkdirSync(parentDir, { recursive: true });
+    }
+    fs.renameSync(fromAbs, toAbs);
+  } catch (error) {
+    return { success: false, action, name: fromRelative, error: error.message };
+  }
+
+  console.log(`📁 Folder moved: ${fromRelative} → ${toRelative}`);
+  return { success: true, action, from: fromRelative, to: toRelative, name: toRelative };
 }
 
 /**
@@ -220,5 +433,10 @@ module.exports = {
   executeFileAction,
   executeAllFileActions,
   isPathSafe,
-  checkPermission
+  isFolderPathSafe,
+  isProtectedFolder,
+  isWithinAllowedRoot,
+  checkPermission,
+  ALLOWED_FOLDERS,
+  PROTECTED_ROOT_FOLDERS
 };
