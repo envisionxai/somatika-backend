@@ -51,7 +51,7 @@ async function callAI(message, project = "custom", scenario = "NORMAL") {
           { role: "user", content: message }
         ],
         temperature: 0.7,
-        max_tokens: 500
+        max_completion_tokens: 4000
       })
     });
 
