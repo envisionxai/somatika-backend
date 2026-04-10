@@ -324,7 +324,6 @@ async function runArchitect(userMessage, userId, memoryContext) {
         { role: "developer", content: systemPrompt },
         { role: "user", content: userMessage }
       ],
-      reasoning: { effort: "medium" },
       max_completion_tokens: 16000
     })
   });

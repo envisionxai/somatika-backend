@@ -50,7 +50,6 @@ async function callAI(message, project = "custom", scenario = "NORMAL") {
           { role: "developer", content: systemPrompt },
           { role: "user", content: message }
         ],
-        reasoning: { effort: "low" },
         max_completion_tokens: 4000
       })
     });

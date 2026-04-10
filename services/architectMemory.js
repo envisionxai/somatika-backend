@@ -120,7 +120,6 @@ assistant: ${assistantReply}
         messages: [
           { role: "user", content: prompt }
         ],
-        reasoning: { effort: "low" },
         max_completion_tokens: 4000
       })
     });
