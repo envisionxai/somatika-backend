@@ -47,10 +47,10 @@ async function callAI(message, project = "custom", scenario = "NORMAL") {
       body: JSON.stringify({
         model: process.env.OPENAI_MODEL || "gpt-5",
         messages: [
-          { role: "system", content: systemPrompt },
+          { role: "developer", content: systemPrompt },
           { role: "user", content: message }
         ],
-        temperature: 0.7,
+        reasoning: { effort: "low" },
         max_completion_tokens: 4000
       })
     });

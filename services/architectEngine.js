@@ -321,10 +321,10 @@ async function runArchitect(userMessage, userId, memoryContext) {
     body: JSON.stringify({
       model: process.env.OPENAI_MODEL || "gpt-5",
       messages: [
-        { role: "system", content: systemPrompt },
+        { role: "developer", content: systemPrompt },
         { role: "user", content: userMessage }
       ],
-      temperature: 0.3,
+      reasoning: { effort: "medium" },
       max_completion_tokens: 16000
     })
   });
