@@ -70,7 +70,7 @@ async function processMessage(userId, project, message) {
     type: "ai",
     scenario,
     scenarioConfig,
-    model: "gpt-4o-mini"
+    model: "gpt-5-mini"
   };
 }
 
