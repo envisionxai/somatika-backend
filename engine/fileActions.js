@@ -2,12 +2,18 @@
  * File Actions — Универсальный парсер и исполнитель файловых операций
  * Поддержка файлов: CREATE, UPDATE, DELETE, MOVE, RENAME
  * Поддержка папок: MKDIR, RMDIR, MOVE_DIR, RENAME_DIR
+ *
+ * SAFETY (post-incident 2026-04-09):
+ * - Детектор плейсхолдеров — блокирует CREATE/UPDATE с фейковым контентом типа "(содержимое файла)"
+ * - Защита от перезаписи — CREATE на существующем файле требует явный UPDATE
+ * - Гард деструктивных операций — DELETE/RMDIR/MOVE/RENAME из ответа AI блокируются
+ *   без явного намерения пользователя в исходном сообщении
  */
 
 const fs = require("fs");
 const path = require("path");
 const { saveFile, deleteFile } = require("./fileManager");
-const { STORAGE_BASE } = require("./fileRouter");
+const { STORAGE_BASE, getFullPath } = require("./fileRouter");
 
 // Разрешённые корневые папки для операций (файлы и подпапки)
 const ALLOWED_FOLDERS = ["patches", "protocols", "scenarios", "misc", "memory", "sessions", "projects"];
@@ -15,6 +21,106 @@ const ALLOWED_FOLDERS = ["patches", "protocols", "scenarios", "misc", "memory", 
 // но внутрь которых можно писать (core содержит системные файлы архитектора)
 const PROTECTED_ROOT_FOLDERS = ["core"];
 const RESTRICTED_FOLDERS = ["core"]; // legacy: только чтение для DELETE файлов
+
+// Деструктивные операции (требуют явного намерения пользователя при source=ai_reply)
+const DESTRUCTIVE_ACTIONS = new Set([
+  "DELETE", "RMDIR", "MOVE", "RENAME", "MOVE_DIR", "RENAME_DIR"
+]);
+
+// Слова в сообщении пользователя, которые подтверждают деструктивное намерение.
+// Если хоть одно встречается — AI разрешено выполнять деструктивную операцию из своего ответа.
+const DESTRUCTIVE_INTENT_WORDS = [
+  "удали", "удалить", "удаляй", "удаление", "сотри", "стереть", "убери", "уберите",
+  "перенеси", "перемести", "переместить", "переименуй", "переименовать",
+  "delete", "remove", "rename", "move", "rm ", "drop"
+];
+
+// Паттерны контента, которые означают плейсхолдер / галлюцинацию AI вместо реального файла.
+// Любой матч → блокировать CREATE/UPDATE.
+const PLACEHOLDER_PATTERNS = [
+  /^\(содержимое\s+файла\)\s*$/i,
+  /^\(содержание\s+файла\)\s*$/i,
+  /^\(текст\s+файла\)\s*$/i,
+  /^содержимое\s+файла\s*$/i,
+  /^<\s*содерж[^>]*>\s*$/i,
+  /^<\s*контент[^>]*>\s*$/i,
+  /^<\s*content[^>]*>\s*$/i,
+  /^\(content[^)]*\)\s*$/i,
+  /^\.{3,}\s*$/,
+  /^…+\s*$/,
+  /^\(\s*\.{2,}\s*\)\s*$/,
+  /^\[\s*\.{2,}\s*\]\s*$/
+];
+
+/**
+ * Проверка: похож ли контент на плейсхолдер / симуляцию?
+ * @param {string} content
+ * @returns {{ isPlaceholder: boolean, reason: string }}
+ */
+function detectPlaceholderContent(content) {
+  if (content === null || content === undefined) {
+    return { isPlaceholder: true, reason: "content is null" };
+  }
+  const trimmed = String(content).trim();
+  if (trimmed.length === 0) {
+    return { isPlaceholder: true, reason: "content is empty" };
+  }
+  // Прямые матчи плейсхолдеров
+  for (const re of PLACEHOLDER_PATTERNS) {
+    if (re.test(trimmed)) {
+      return { isPlaceholder: true, reason: `matched placeholder pattern: ${re}` };
+    }
+  }
+  // Подозрительно короткий контент в круглых/угловых скобках без точек/строк
+  if (trimmed.length < 60 && /^[<(\[].*[>)\]]$/.test(trimmed) && !/[.\n]/.test(trimmed)) {
+    return { isPlaceholder: true, reason: "short bracketed content with no real text" };
+  }
+  return { isPlaceholder: false, reason: "" };
+}
+
+/**
+ * Проверка: разрешено ли AI выполнять деструктивную операцию в данном контексте?
+ * @param {string} action
+ * @param {object} options — { source, userMessage }
+ * @returns {{ allowed: boolean, reason: string }}
+ */
+function checkDestructiveAllowed(action, options) {
+  if (!DESTRUCTIVE_ACTIONS.has(action)) {
+    return { allowed: true, reason: "not destructive" };
+  }
+  const source = options && options.source;
+  if (source !== "ai_reply") {
+    // Из user-direct блока — доверяем
+    return { allowed: true, reason: "user-direct source" };
+  }
+  // Из AI reply — проверяем намерение в исходном сообщении пользователя
+  const userMessage = (options && options.userMessage) ? String(options.userMessage).toLowerCase() : "";
+  const matched = DESTRUCTIVE_INTENT_WORDS.find(w => userMessage.includes(w));
+  if (matched) {
+    return { allowed: true, reason: `user intent matched: "${matched}"` };
+  }
+  return {
+    allowed: false,
+    reason: `destructive op '${action}' from AI reply blocked: user message has no destructive intent words`
+  };
+}
+
+/**
+ * Прочитать содержимое существующего файла (без падения при ошибке)
+ * @param {string} relativeName
+ * @returns {string|null}
+ */
+function safeReadExisting(relativeName) {
+  try {
+    const full = getFullPath(relativeName);
+    if (!fs.existsSync(full)) return null;
+    const stats = fs.statSync(full);
+    if (!stats.isFile()) return null;
+    return fs.readFileSync(full, "utf-8");
+  } catch (e) {
+    return null;
+  }
+}
 
 /**
  * Валидация пути — запрет выхода за storage/
@@ -220,15 +326,33 @@ function parseFileMessage(text) {
 /**
  * Выполнение файловой операции
  * @param {object} fileOp — распарсенный блок { action, name, path, content, from, to, force }
- * @returns {{ success: boolean, action: string, name: string, error?: string }}
+ * @param {object} [options] — { source: 'user'|'ai_reply', userMessage: string }
+ *   source='user' — блок пришёл напрямую от пользователя (доверяем)
+ *   source='ai_reply' — блок сгенерирован AI (применяются доп. гарды)
+ * @returns {{ success: boolean, action: string, name: string, error?: string, blocked?: boolean }}
  */
-function executeFileAction(fileOp) {
+function executeFileAction(fileOp, options) {
+  options = options || {};
   const { action, content, force } = fileOp;
   // Нормализация всех путей — страхуемся на случай прямого вызова в обход парсера
   const name = normalizeRelativePath(fileOp.name);
   const from = normalizeRelativePath(fileOp.from);
   const to = normalizeRelativePath(fileOp.to);
   const targetPath = normalizeRelativePath(fileOp.path) || name;
+
+  // --- ГАРД 1: деструктивные операции из AI reply требуют явного намерения пользователя ---
+  const destructiveCheck = checkDestructiveAllowed(action, options);
+  if (!destructiveCheck.allowed) {
+    console.warn(`🛑 BLOCKED destructive op: ${action} ${name || targetPath || ""} — ${destructiveCheck.reason}`);
+    return {
+      success: false,
+      blocked: true,
+      action,
+      name: name || targetPath || "",
+      error: `Деструктивная операция ${action} заблокирована: пользователь не выразил явного намерения. ` +
+             `Попроси подтверждения, и пользователь пришлёт блок [MODE: FILE] напрямую.`
+    };
+  }
 
   switch (action) {
     case "CREATE":
@@ -240,9 +364,48 @@ function executeFileAction(fileOp) {
       if (!perm.allowed) {
         return { success: false, action, name, error: perm.reason };
       }
-      if (!content) {
+      if (content === null || content === undefined) {
         return { success: false, action, name, error: "No content provided" };
       }
+
+      // --- ГАРД 2: детектор плейсхолдеров / галлюцинированного контента ---
+      const placeholderCheck = detectPlaceholderContent(content);
+      if (placeholderCheck.isPlaceholder) {
+        console.warn(`🛑 BLOCKED placeholder content: ${action} ${name} — ${placeholderCheck.reason}`);
+        return {
+          success: false,
+          blocked: true,
+          action,
+          name,
+          error: `Контент выглядит как плейсхолдер/симуляция (${placeholderCheck.reason}). ` +
+                 `Нельзя создать файл с фейковым содержимым.`
+        };
+      }
+
+      // --- ГАРД 3: защита от перезаписи существующего файла через CREATE ---
+      // CREATE не должен безмолвно затирать существующий файл. UPDATE — должен (это его семантика).
+      if (action === "CREATE") {
+        const existing = safeReadExisting(name);
+        if (existing !== null) {
+          // Если контент идентичный — идемпотентный no-op, разрешаем
+          if (existing === content) {
+            console.log(`ℹ️ CREATE идемпотентен (контент идентичен): ${name}`);
+            const result = saveFile(name, content);
+            return { success: true, action, name, path: result.path, idempotent: true };
+          }
+          // Контент другой — блокируем
+          console.warn(`🛑 BLOCKED CREATE on existing file: ${name} (existing ${existing.length}b, new ${content.length}b)`);
+          return {
+            success: false,
+            blocked: true,
+            action,
+            name,
+            error: `Файл ${name} уже существует (${existing.length} байт). ` +
+                   `CREATE не перезаписывает существующие файлы. Используй ACTION: UPDATE явно, если хочешь изменить.`
+          };
+        }
+      }
+
       const result = saveFile(name, content);
       return { success: true, action, name, path: result.path };
     }
@@ -445,11 +608,38 @@ function moveFile(fromRelative, toRelative) {
 /**
  * Выполнение всех файловых операций из текста
  * @param {string} text — текст с [MODE: FILE] блоками
+ * @param {object} [options] — { source: 'user'|'ai_reply', userMessage: string }
  * @returns {Array<object>} — результаты операций
  */
-function executeAllFileActions(text) {
+function executeAllFileActions(text, options) {
   const blocks = parseFileBlocks(text);
-  return blocks.map(block => executeFileAction(block));
+  return blocks.map(block => executeFileAction(block, options));
+}
+
+/**
+ * Форматирует результаты файловых операций в человекочитаемый постскриптум,
+ * который можно приклеить к ответу AI. Нужно, чтобы пользователь видел реальный
+ * результат операций, а не то, что AI заявил в тексте.
+ *
+ * @param {Array<object>} results — результаты executeAllFileActions
+ * @returns {string} — постскриптум (пустая строка, если операций не было)
+ */
+function formatFileOpsPostscript(results) {
+  if (!Array.isArray(results) || results.length === 0) return "";
+
+  const lines = ["", "---", "⚙️ **Результат файловых операций (отчёт сервера):**"];
+  for (const r of results) {
+    const label = r.name || r.path || r.from || "?";
+    if (r.success) {
+      const tag = r.idempotent ? "↺" : "✓";
+      lines.push(`${tag} ${r.action} ${label}`);
+    } else if (r.blocked) {
+      lines.push(`🛑 ${r.action} ${label} — ЗАБЛОКИРОВАНО: ${r.error}`);
+    } else {
+      lines.push(`✗ ${r.action} ${label} — ОШИБКА: ${r.error}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 module.exports = {
@@ -457,11 +647,17 @@ module.exports = {
   parseFileMessage,
   executeFileAction,
   executeAllFileActions,
+  formatFileOpsPostscript,
+  detectPlaceholderContent,
+  checkDestructiveAllowed,
   isPathSafe,
   isFolderPathSafe,
   isProtectedFolder,
   isWithinAllowedRoot,
   checkPermission,
   ALLOWED_FOLDERS,
-  PROTECTED_ROOT_FOLDERS
+  PROTECTED_ROOT_FOLDERS,
+  DESTRUCTIVE_ACTIONS,
+  DESTRUCTIVE_INTENT_WORDS,
+  PLACEHOLDER_PATTERNS
 };

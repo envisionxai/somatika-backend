@@ -23,9 +23,10 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ success: false, error: "Message is required" });
     }
 
-    // Проверка: если пользователь отправляет [MODE: FILE] напрямую
+    // Проверка: если пользователь отправляет [MODE: FILE] напрямую.
+    // source='user' — доверяем, деструктивные операции разрешены без доп. проверки намерения.
     if (message.includes("[MODE: FILE]") || message.includes("[MODE: PATCH]")) {
-      const fileResults = executeAllFileActions(message);
+      const fileResults = executeAllFileActions(message, { source: "user", userMessage: message });
       const succeeded = fileResults.filter(r => r.success);
       const failed = fileResults.filter(r => !r.success);
 

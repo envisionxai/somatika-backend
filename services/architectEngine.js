@@ -1,10 +1,23 @@
 const fs = require("fs");
 const path = require("path");
 const fetch = require("node-fetch");
-const { executeAllFileActions } = require("../engine/fileActions");
+const { executeAllFileActions, formatFileOpsPostscript } = require("../engine/fileActions");
 
 const STORAGE_PATH = path.join(__dirname, "..", "storage");
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
+
+// Поддерживаемые текстовые расширения для чтения файлов пользователя
+const READABLE_EXTENSIONS = new Set([
+  ".txt", ".md", ".json", ".yaml", ".yml", ".csv", ".log",
+  ".js", ".ts", ".py", ".html", ".css", ".xml", ".ini", ".conf"
+]);
+
+function isReadableFile(fileName) {
+  const lower = fileName.toLowerCase();
+  const ext = path.extname(lower);
+  if (ext === "") return true; // файлы без расширения — читаем
+  return READABLE_EXTENSIONS.has(ext);
+}
 
 function readFolder(folderName) {
   const folderPath = path.join(STORAGE_PATH, folderName);
@@ -34,22 +47,158 @@ function scanStorageStructure() {
   return structure;
 }
 
-function readFolderLimited(folderName, maxTotalChars) {
+/**
+ * Рекурсивно читает файлы из папки с умным лимитом.
+ *
+ * ФИКС post-2026-04-09: старый readFolderLimited не был рекурсивным, читал только .txt,
+ * и при первом большом файле обрезал всё остальное на `break`. В результате AI физически
+ * не видел большинства файлов в misc/, но промпт уверял его в обратном — и AI галлюцинировал.
+ *
+ * Новая логика:
+ * 1. Рекурсивный обход всех подпапок
+ * 2. Читаем все текстовые расширения из READABLE_EXTENSIONS
+ * 3. Сортировка по размеру (меньшие сначала) — чтобы маленькие файлы гарантированно попали
+ * 4. Per-file лимит: большие файлы обрезаются head+tail, а не отбрасываются целиком
+ * 5. Per-folder лимит: если бюджет исчерпан, файл отмечается included=false, но остаётся в индексе
+ * 6. Возвращается и content, и file index metadata — для UPLOADED FILES INDEX блока в промпте
+ *
+ * @param {string} folderName — имя папки относительно storage/
+ * @param {object} opts — { maxFileChars, maxTotalChars }
+ * @returns {{ content: string, files: Array<{relPath, size, included, truncated, reason?}> }}
+ */
+function readFolderRecursive(folderName, opts) {
+  opts = opts || {};
+  const maxFileChars = opts.maxFileChars || 12000;
+  const maxTotalChars = opts.maxTotalChars || 80000;
+
   const folderPath = path.join(STORAGE_PATH, folderName);
-  if (!fs.existsSync(folderPath)) return "";
-  const files = fs.readdirSync(folderPath).filter(f => f.endsWith(".txt")).sort();
-  let total = 0;
-  const parts = [];
-  for (const f of files) {
-    const content = fs.readFileSync(path.join(folderPath, f), "utf-8");
-    if (total + content.length > maxTotalChars) {
-      parts.push("--- " + f + " ---\n" + content.substring(0, maxTotalChars - total) + "\n[...обрезано]");
-      break;
-    }
-    parts.push("--- " + f + " ---\n" + content);
-    total += content.length;
+  if (!fs.existsSync(folderPath)) {
+    return { content: "", files: [] };
   }
-  return parts.join("\n\n");
+
+  // Собрать все файлы рекурсивно
+  const allFiles = [];
+  function walk(dir, relPrefix) {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (e) {
+      return;
+    }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      const rel = relPrefix ? `${relPrefix}/${e.name}` : e.name;
+      if (e.isDirectory()) {
+        walk(full, rel);
+      } else if (e.isFile()) {
+        if (!isReadableFile(e.name)) continue;
+        let stats;
+        try {
+          stats = fs.statSync(full);
+        } catch (err) {
+          continue;
+        }
+        allFiles.push({ relPath: rel, fullPath: full, size: stats.size });
+      }
+    }
+  }
+  walk(folderPath, "");
+
+  // Сортировка: сначала маленькие, чтобы они гарантированно попали в контекст
+  allFiles.sort((a, b) => a.size - b.size);
+
+  let totalChars = 0;
+  const parts = [];
+  const fileMeta = [];
+
+  for (const f of allFiles) {
+    // Если общий бюджет уже исчерпан — отмечаем как "не в контексте"
+    if (totalChars >= maxTotalChars) {
+      fileMeta.push({
+        relPath: f.relPath,
+        size: f.size,
+        included: false,
+        truncated: false,
+        reason: "budget exhausted"
+      });
+      continue;
+    }
+
+    let content;
+    try {
+      content = fs.readFileSync(f.fullPath, "utf-8");
+    } catch (e) {
+      fileMeta.push({
+        relPath: f.relPath,
+        size: f.size,
+        included: false,
+        truncated: false,
+        reason: "read error: " + e.message
+      });
+      continue;
+    }
+
+    let included = content;
+    let truncated = false;
+
+    // Per-file лимит: head + tail, если файл больше лимита
+    if (included.length > maxFileChars) {
+      const headLen = Math.floor(maxFileChars * 0.8);
+      const tailLen = Math.floor(maxFileChars * 0.2);
+      const head = included.substring(0, headLen);
+      const tail = included.substring(included.length - tailLen);
+      included = head +
+        `\n\n[... ФАЙЛ ОБРЕЗАН — реальный размер ${f.size} байт, показано ~${maxFileChars} симв (начало + конец) ...]\n\n` +
+        tail;
+      truncated = true;
+    }
+
+    // Total budget check — если не влезает даже обрезанный
+    if (totalChars + included.length > maxTotalChars) {
+      const remaining = maxTotalChars - totalChars;
+      if (remaining < 500) {
+        fileMeta.push({
+          relPath: f.relPath,
+          size: f.size,
+          included: false,
+          truncated: false,
+          reason: "budget exhausted"
+        });
+        continue;
+      }
+      included = included.substring(0, remaining) + `\n[... ОБРЕЗАНО ПО ОБЩЕМУ ЛИМИТУ ПАПКИ ...]`;
+      truncated = true;
+    }
+
+    parts.push(`--- ${f.relPath} (${f.size} bytes${truncated ? ", TRUNCATED" : ""}) ---\n${included}`);
+    totalChars += included.length;
+    fileMeta.push({
+      relPath: f.relPath,
+      size: f.size,
+      included: true,
+      truncated
+    });
+  }
+
+  return { content: parts.join("\n\n"), files: fileMeta };
+}
+
+/**
+ * Сформировать человекочитаемый индекс файлов для инъекции в промпт.
+ * AI должен точно знать: какие файлы есть, какие обрезаны, какие вообще не в контексте.
+ */
+function formatFileIndex(folderName, files) {
+  if (!files || files.length === 0) {
+    return `(папка ${folderName}/ пуста или недоступна)`;
+  }
+  const lines = files.map(f => {
+    let status;
+    if (f.included && !f.truncated) status = "[FULL]";
+    else if (f.included && f.truncated) status = "[TRUNCATED — смотри содержимое ниже]";
+    else status = `[NOT IN CONTEXT — ${f.reason || "unknown"}]`;
+    return `- ${folderName}/${f.relPath} (${f.size} bytes) ${status}`;
+  });
+  return lines.join("\n");
 }
 
 function buildArchitectPrompt(userId, memoryContext) {
@@ -57,7 +206,12 @@ function buildArchitectPrompt(userId, memoryContext) {
   const protocols = readFolder("protocols");
   const scenarios = readFolder("scenarios");
   const patches = readFolder("patches");
-  const misc = readFolderLimited("misc", 10000);
+
+  // Рекурсивный reader с per-file лимитом и явным индексом.
+  // Лимиты подобраны так, чтобы даже при нескольких больших файлах маленькие гарантированно
+  // попали в контекст (они сортируются по размеру — маленькие первыми).
+  const miscResult = readFolderRecursive("misc", { maxFileChars: 12000, maxTotalChars: 80000 });
+
   const storageStructure = scanStorageStructure();
   const structureText = Object.entries(storageStructure)
     .map(([folder, files]) => folder + "/\n" + files.map(f => "  - " + f).join("\n"))
@@ -65,8 +219,18 @@ function buildArchitectPrompt(userId, memoryContext) {
 
   let prompt = "=== SYSTEM INFO ===\nServer: active\nMode: architect\nStorage structure:\n\n" + structureText;
   prompt += "\n\n=== SYSTEM FILES ===\n\n" + core + "\n\n" + protocols + "\n\n" + scenarios + "\n\n" + patches;
-  if (misc) {
-    prompt += "\n\n=== UPLOADED FILES (misc/) ===\n\n" + misc;
+
+  // Явный индекс загруженных файлов — ПЕРЕД содержимым.
+  // AI должен точно знать, какие файлы в контексте, какие обрезаны, какие вообще не видны.
+  prompt += "\n\n=== UPLOADED FILES INDEX (misc/) ===\n";
+  prompt += formatFileIndex("misc", miscResult.files);
+  prompt += "\n\nЛегенда:\n";
+  prompt += "  [FULL] — файл полностью в твоём контексте, можешь его читать\n";
+  prompt += "  [TRUNCATED] — файл большой, в контексте только начало+конец, реальный размер указан\n";
+  prompt += "  [NOT IN CONTEXT] — файл на диске существует, но НЕ в твоём контексте (бюджет/ошибка чтения). Ты НЕ МОЖЕШЬ его прочитать.\n";
+
+  if (miscResult.content) {
+    prompt += "\n=== UPLOADED FILES CONTENT ===\n\n" + miscResult.content;
   }
 
   // Блок памяти (если есть)
@@ -84,15 +248,52 @@ function buildArchitectPrompt(userId, memoryContext) {
 
   prompt += "\n\n=== ROLE ===\n";
   prompt += "Ты — Архитектор. Главный управляющий AI-модуль системы.\n";
-  prompt += "Ты имеешь доступ ко всем файлам системы. Ты видишь структуру storage и содержимое файлов.\n";
-  prompt += "Загруженные пользователем файлы находятся в misc/. Их содержимое доступно тебе в секции UPLOADED FILES.\n";
+  prompt += "Ты имеешь доступ к файлам системы через инъекцию в системный промпт (секции выше).\n";
   prompt += "По умолчанию ты работаешь как управляющий центр: анализируешь, управляешь, создаёшь патчи.\n";
   prompt += "По прямой команде владельца можешь временно перейти в режим ассистента.\n";
   prompt += "После выполнения задачи возвращаешься в режим Архитектора.\n\n";
+
+  // ============================================================
+  // КРИТИЧЕСКИЕ ПРАВИЛА ЧЕСТНОСТИ (post-incident 2026-04-09)
+  // ============================================================
+  prompt += "=== КРИТИЧЕСКИЕ ПРАВИЛА ЧЕСТНОСТИ (ОБЯЗАТЕЛЬНО) ===\n";
+  prompt += "1. ЗАПРЕЩЕНО СИМУЛИРОВАТЬ ПРОЦЕСС.\n";
+  prompt += "   Не пиши: «жду», «подождите», «анализирую», «сейчас прочитаю», «это займёт минуту».\n";
+  prompt += "   Все операции синхронные. К моменту, когда пользователь читает твой ответ, результат уже есть.\n";
+  prompt += "   Если не можешь сделать — скажи это СРАЗУ, не симулируй процесс.\n\n";
+
+  prompt += "2. ЗАПРЕЩЕНО ЧИТАТЬ ФАЙЛЫ, КОТОРЫХ НЕТ В ТВОЁМ КОНТЕКСТЕ.\n";
+  prompt += "   Смотри UPLOADED FILES INDEX. Файл с [FULL] или [TRUNCATED] — читабелен.\n";
+  prompt += "   Файл с [NOT IN CONTEXT] или вообще не в индексе — ты его НЕ ВИДИШЬ. Не симулируй чтение.\n";
+  prompt += "   Если пользователь просит прочитать такой файл — скажи честно: «Я вижу имя файла X в структуре, но его содержимого нет в моём контексте. Возможно, файл слишком большой и был вытеснен бюджетом, или не в поддерживаемом формате. Я не могу прочитать его содержимое.»\n\n";
+
+  prompt += "3. ЗАПРЕЩЕНО ПИСАТЬ ПЛЕЙСХОЛДЕРЫ В CONTENT.\n";
+  prompt += "   НИКОГДА не пиши в CONTENT: «(содержимое файла)», «<контент>», «...», «(text)», пустую строку.\n";
+  prompt += "   Если ты не знаешь реального содержимого — НЕ СОЗДАВАЙ файл. Точка.\n";
+  prompt += "   Сервер блокирует такие блоки и вернёт ошибку в постскриптуме — ты будешь выглядеть дураком, а пользователь разозлится.\n\n";
+
+  prompt += "4. ЗАПРЕЩЕНО ПЕРЕЗАПИСЫВАТЬ СУЩЕСТВУЮЩИЕ ФАЙЛЫ ЧЕРЕЗ CREATE.\n";
+  prompt += "   CREATE работает только для НОВОГО файла. Если файл уже есть в storage — используй ACTION: UPDATE явно.\n";
+  prompt += "   Сервер блокирует CREATE над существующим файлом. Это защита от потери данных.\n\n";
+
+  prompt += "5. ЗАПРЕЩЕНО ДЕСТРУКТИВНЫЕ ДЕЙСТВИЯ БЕЗ ЯВНОГО НАМЕРЕНИЯ ПОЛЬЗОВАТЕЛЯ.\n";
+  prompt += "   DELETE, RMDIR, MOVE, RENAME, MOVE_DIR, RENAME_DIR — только если пользователь явно попросил («удали», «перенеси», «переименуй» и т.п.).\n";
+  prompt += "   Если пользователь просит «проанализируй» — НЕ удаляй и НЕ перемещай ничего.\n";
+  prompt += "   Сервер блокирует деструктивные операции из твоего ответа, если в сообщении пользователя нет таких слов. Ты получишь ошибку в постскриптуме.\n\n";
+
+  prompt += "6. ПАМЯТЬ — ЭТО РЕАЛЬНО ТВОЙ КОНТЕКСТ.\n";
+  prompt += "   Блоки OWNER PROFILE, USER MEMORY, RECENT HISTORY — это твоя память об этом пользователе и прошлых беседах.\n";
+  prompt += "   НЕ говори «я не помню вчерашний разговор» если в этих блоках есть данные. Читай их и используй.\n";
+  prompt += "   Если блоков нет — тогда да, памяти нет, так и скажи.\n\n";
+
+  prompt += "7. ЧЕСТНОСТЬ ПРО ОПЕРАЦИИ.\n";
+  prompt += "   Не пиши «Папка удалена», «Файл создан», «Готово» до того, как убедился, что операция успешна.\n";
+  prompt += "   Сервер сам добавит к твоему ответу постскриптум с реальными результатами операций.\n";
+  prompt += "   Поэтому лучше опиши ЧТО ты пытаешься сделать, а не утверждай ЧТО сделано.\n\n";
+
   prompt += "=== FILE & FOLDER OPERATIONS ===\n";
-  prompt += "ВАЖНО: все операции выполняются СРАЗУ после твоего ответа — парсер читает блоки [MODE: FILE] и применяет их синхронно.\n";
-  prompt += "НЕ пиши фразы «жду ответа», «выполняется», «подождите» — к моменту, когда пользователь читает твой ответ, операция УЖЕ выполнена.\n";
-  prompt += "Просто выведи блок и кратко подтверди действие: «Папка создана» / «Файл обновлён» / «Удалено».\n";
+  prompt += "Все операции выполняются синхронно сразу после твоего ответа. Сервер парсит блоки [MODE: FILE] и применяет их.\n";
+  prompt += "После выполнения сервер добавляет к твоему ответу отчёт с реальными результатами (✓/✗/🛑).\n";
   prompt += "Не оборачивай блоки [MODE: FILE] в markdown code fence (```), пиши их как есть.\n\n";
 
   prompt += "--- ПРАВИЛА ПУТЕЙ ---\n";
@@ -103,31 +304,50 @@ function buildArchitectPrompt(userId, memoryContext) {
 
   prompt += "--- ФАЙЛОВЫЕ ОПЕРАЦИИ ---\n";
   prompt += "Формат:\n\n";
-  prompt += "[MODE: FILE]\nACTION: CREATE | UPDATE | DELETE | MOVE | RENAME\nNAME: путь/к/файлу\nCONTENT:\n...содержимое...\n[END FILE]\n\n";
-  prompt += "- ACTION по умолчанию: CREATE. Для MOVE/RENAME используй FROM: и TO: вместо NAME.\n";
-  prompt += "- Папка core: файлы можно только создавать/обновлять, нельзя удалять.\n\n";
+  prompt += "[MODE: FILE]\nACTION: CREATE | UPDATE | DELETE | MOVE | RENAME\nNAME: путь/к/файлу\nCONTENT:\n...реальное содержимое, не плейсхолдер...\n[END FILE]\n\n";
+  prompt += "- CREATE — только для нового файла. Для существующего используй UPDATE.\n";
+  prompt += "- UPDATE — перезаписывает существующий файл новым содержимым.\n";
+  prompt += "- DELETE — удаляет файл. Требует явного намерения пользователя («удали»).\n";
+  prompt += "- MOVE/RENAME — используй FROM: и TO: вместо NAME. Требует явного намерения пользователя.\n";
+  prompt += "- Папка core: только CREATE/UPDATE, нельзя удалять.\n\n";
 
   prompt += "--- ОПЕРАЦИИ С ПАПКАМИ ---\n";
   prompt += "Формат:\n\n";
   prompt += "[MODE: FILE]\nACTION: MKDIR | RMDIR | MOVE_DIR | RENAME_DIR\nPATH: путь/к/папке\nFROM: старый_путь (для MOVE_DIR/RENAME_DIR)\nTO: новый_путь (для MOVE_DIR/RENAME_DIR)\nFORCE: true (опционально, для RMDIR непустой папки)\n[END FILE]\n\n";
-  prompt += "- MKDIR — создаёт папку (включая промежуточные). Идемпотентно.\n";
-  prompt += "- RMDIR — удаляет ПУСТУЮ папку. Для непустой добавь FORCE: true (рекурсивно, опасно!).\n";
-  prompt += "- MOVE_DIR / RENAME_DIR — перемещает/переименовывает папку (только FROM: и TO:, без NAME/PATH).\n";
-  prompt += "- Папка core/ защищена: нельзя удалять, переименовывать или перемещать её целиком. Но внутри core/ можно создавать подпапки.\n";
-  prompt += "- Для деструктивных действий (DELETE, RMDIR с FORCE, массовые операции) — сначала предложи и ЖДИ подтверждения в следующем сообщении, не выполняй сразу.\n\n";
+  prompt += "- MKDIR — создаёт папку. Идемпотентно.\n";
+  prompt += "- RMDIR — удаляет ПУСТУЮ папку. Для непустой — FORCE: true (но это деструктивно и требует явного намерения).\n";
+  prompt += "- MOVE_DIR / RENAME_DIR — только FROM: и TO:. Требует явного намерения.\n";
+  prompt += "- НИКОГДА не используй RMDIR для удаления файла! RMDIR только для папок, для файлов — DELETE.\n";
+  prompt += "- Папка core/ защищена: нельзя удалять целиком.\n\n";
 
-  prompt += "--- ПРИМЕРЫ ---\n";
+  prompt += "--- ПРИМЕРЫ ПРАВИЛЬНОГО ПОВЕДЕНИЯ ---\n\n";
+  prompt += "Пример 1: пользователь просит прочитать файл, которого нет в контексте\n";
+  prompt += "User: «прочитай файл report.pdf»\n";
+  prompt += "Assistant: «Я не вижу файл report.pdf в своём контексте. PDF-формат не поддерживается для чтения. Загрузи его как .txt через кнопку 📎, и я смогу прочитать.»\n\n";
+
+  prompt += "Пример 2: пользователь просит проанализировать файл, которого нет в INDEX\n";
+  prompt += "User: «проанализируй notes.txt»\n";
+  prompt += "Assistant: «Я не вижу notes.txt в UPLOADED FILES INDEX. Либо он не был загружен, либо вытеснен бюджетом контекста. Загрузи файл заново через 📎 или уточни путь.»\n\n";
+
+  prompt += "Пример 3: создание нового файла\n";
+  prompt += "User: «создай файл misc/todo.txt с текстом 'купить молоко'»\n";
+  prompt += "Assistant: «Создаю.\n[MODE: FILE]\nACTION: CREATE\nNAME: misc/todo.txt\nCONTENT:\nкупить молоко\n[END FILE]»\n";
+  prompt += "(сервер добавит отчёт об успехе/ошибке)\n\n";
+
+  prompt += "Пример 4: обновление существующего файла\n";
+  prompt += "User: «добавь в misc/todo.txt ещё 'хлеб'»\n";
+  prompt += "Assistant: «Обновляю (использую UPDATE, т.к. файл уже существует).\n[MODE: FILE]\nACTION: UPDATE\nNAME: misc/todo.txt\nCONTENT:\nкупить молоко\nхлеб\n[END FILE]»\n\n";
+
   prompt += "Пример MKDIR:\n";
   prompt += "[MODE: FILE]\nACTION: MKDIR\nPATH: misc/test_folder\n[END FILE]\n\n";
   prompt += "Пример MOVE_DIR:\n";
   prompt += "[MODE: FILE]\nACTION: MOVE_DIR\nFROM: misc/old_name\nTO: misc/new_name\n[END FILE]\n\n";
-  prompt += "Пример RMDIR с подтверждением:\n";
-  prompt += "[MODE: FILE]\nACTION: RMDIR\nPATH: misc/test_folder\nFORCE: true\n[END FILE]\n\n";
+
   prompt += "=== FILE UPLOAD ===\n";
-  prompt += "Пользователь может загружать файлы через кнопку 📎 (скрепка) в чате.\n";
-  prompt += "Загруженные файлы автоматически сохраняются в storage/misc/ и их содержимое доступно тебе.\n";
-  prompt += "Если пользователь хочет отправить файл — подскажи нажать на кнопку 📎 рядом с полем ввода.\n";
-  prompt += "После загрузки файл появится в секции UPLOADED FILES и ты сможешь прочитать его содержимое.\n";
+  prompt += "Пользователь может загружать файлы через кнопку 📎 в чате.\n";
+  prompt += "Загруженные файлы сохраняются в storage/misc/ и появляются в UPLOADED FILES INDEX.\n";
+  prompt += "Если пользователь хочет отправить файл — подскажи нажать на кнопку 📎.\n";
+  prompt += "ВАЖНО: после загрузки проверь UPLOADED FILES INDEX — если файла там нет или он [NOT IN CONTEXT], скажи об этом честно.\n";
 
   return prompt;
 }
@@ -161,21 +381,36 @@ async function runArchitect(userMessage, userId, memoryContext) {
   }
 
   const data = await response.json();
-  const reply = data.choices[0].message.content;
+  const rawReply = data.choices[0].message.content;
 
-  // Выполняем все файловые операции из ответа AI (CREATE/UPDATE/DELETE/MOVE/RENAME)
-  const fileResults = executeAllFileActions(reply);
+  // Выполняем все файловые операции из ответа AI с гардами (source=ai_reply).
+  // Деструктивные операции без явного намерения пользователя — блокируются.
+  // CREATE на существующем файле — блокируется.
+  // Плейсхолдеры в CONTENT — блокируются.
+  const fileResults = executeAllFileActions(rawReply, {
+    source: "ai_reply",
+    userMessage
+  });
   const savedFiles = fileResults.filter(r => r.success);
   const failedFiles = fileResults.filter(r => !r.success);
+  const blockedFiles = fileResults.filter(r => r.blocked);
 
   if (savedFiles.length > 0) {
     console.log(`Architect file operations: ${savedFiles.length} succeeded`);
   }
-  if (failedFiles.length > 0) {
-    console.warn(`Architect file operations: ${failedFiles.length} failed`, failedFiles);
+  if (blockedFiles.length > 0) {
+    console.warn(`Architect file operations: ${blockedFiles.length} BLOCKED by safety guards`, blockedFiles);
+  }
+  if (failedFiles.length > blockedFiles.length) {
+    console.warn(`Architect file operations: ${failedFiles.length - blockedFiles.length} failed (other errors)`, failedFiles);
   }
 
-  return { reply, savedFiles, failedFiles };
+  // Постскриптум с реальными результатами — приклеивается к ответу AI.
+  // Пользователь должен видеть честную картину, а не только то, что AI написал в тексте.
+  const postscript = formatFileOpsPostscript(fileResults);
+  const reply = postscript ? rawReply + "\n" + postscript : rawReply;
+
+  return { reply, savedFiles, failedFiles, blockedFiles };
 }
 
 module.exports = { runArchitect };
