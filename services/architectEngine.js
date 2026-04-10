@@ -358,6 +358,13 @@ async function runArchitect(userMessage, userId, memoryContext) {
   const apiKey = process.env.OPENAI_API_KEY;
   const systemPrompt = buildArchitectPrompt(userId, memoryContext);
 
+  // DEBUG: проверяем что промпт содержит нужные файлы
+  console.log(`[ARCHITECT DEBUG] prompt length: ${systemPrompt.length} chars`);
+  console.log(`[ARCHITECT DEBUG] model: ${process.env.OPENAI_MODEL || "gpt-5-mini"}`);
+  const hasIndex = systemPrompt.includes("UPLOADED FILES INDEX");
+  const hasFile = systemPrompt.includes("простыня");
+  console.log(`[ARCHITECT DEBUG] has INDEX block: ${hasIndex}, has 'простыня': ${hasFile}`);
+
   const response = await fetch(OPENAI_API_URL, {
     method: "POST",
     headers: {
