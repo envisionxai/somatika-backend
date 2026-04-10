@@ -66,7 +66,7 @@ export async function addPatch(patch) {
  */
 export async function getPatches(project) {
   try {
-    const url = project 
+    const url = project
       ? `${SERVER_URL}/api/patch?project=${project}`
       : `${SERVER_URL}/api/patch`;
 
@@ -123,7 +123,7 @@ export async function deactivatePatch(patchId) {
 export async function getMessageHistory(userId, project, limit = 50) {
   try {
     let url = `${SERVER_URL}/api/message/history?userId=${userId}&limit=${limit}`;
-    
+
     if (project) {
       url += `&project=${project}`;
     }
