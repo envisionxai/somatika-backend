@@ -207,48 +207,23 @@ function buildArchitectPrompt(userId, memoryContext) {
   const scenarios = readFolder("scenarios");
   const patches = readFolder("patches");
 
-  // Рекурсивный reader с per-file лимитом и явным индексом.
-  // Лимиты подобраны так, чтобы даже при нескольких больших файлах маленькие гарантированно
-  // попали в контекст (они сортируются по размеру — маленькие первыми).
-  const miscResult = readFolderRecursive("misc", { maxFileChars: 12000, maxTotalChars: 80000 });
+  // Бюджет снижен с 80K→30K, per-file с 12K→5K — чтобы промпт не превышал ~40K.
+  // Мини-модели теряют информацию из середины длинных промптов ("lost in the middle").
+  const miscResult = readFolderRecursive("misc", { maxFileChars: 5000, maxTotalChars: 30000 });
 
   const storageStructure = scanStorageStructure();
   const structureText = Object.entries(storageStructure)
     .map(([folder, files]) => folder + "/\n" + files.map(f => "  - " + f).join("\n"))
     .join("\n\n");
 
-  let prompt = "=== SYSTEM INFO ===\nServer: active\nMode: architect\nStorage structure:\n\n" + structureText;
-  prompt += "\n\n=== SYSTEM FILES ===\n\n" + core + "\n\n" + protocols + "\n\n" + scenarios + "\n\n" + patches;
+  // ============================================================
+  // ПОРЯДОК ПРОМПТА: роль+правила ПЕРВЫМИ, файлы ПОСЛЕДНИМИ.
+  // Мини-модели лучше всего читают начало и конец промпта.
+  // ============================================================
 
-  // Явный индекс загруженных файлов — ПЕРЕД содержимым.
-  // AI должен точно знать, какие файлы в контексте, какие обрезаны, какие вообще не видны.
-  prompt += "\n\n=== UPLOADED FILES INDEX (misc/) ===\n";
-  prompt += formatFileIndex("misc", miscResult.files);
-  prompt += "\n\nЛегенда:\n";
-  prompt += "  [FULL] — файл полностью в твоём контексте, можешь его читать\n";
-  prompt += "  [TRUNCATED] — файл большой, в контексте только начало+конец, реальный размер указан\n";
-  prompt += "  [NOT IN CONTEXT] — файл на диске существует, но НЕ в твоём контексте (бюджет/ошибка чтения). Ты НЕ МОЖЕШЬ его прочитать.\n";
-
-  if (miscResult.content) {
-    prompt += "\n=== UPLOADED FILES CONTENT ===\n\n" + miscResult.content;
-  }
-
-  // Блок памяти (если есть)
-  if (memoryContext) {
-    if (memoryContext.ownerProfile) {
-      prompt += "\n\n=== OWNER PROFILE ===\n" + memoryContext.ownerProfile;
-    }
-    if (memoryContext.semanticMemory) {
-      prompt += "\n\n=== USER MEMORY ===\n" + memoryContext.semanticMemory;
-    }
-    if (memoryContext.recentHistory) {
-      prompt += "\n\n=== RECENT HISTORY ===\n" + memoryContext.recentHistory;
-    }
-  }
-
-  prompt += "\n\n=== ROLE ===\n";
+  let prompt = "=== ROLE ===\n";
   prompt += "Ты — Архитектор. Главный управляющий AI-модуль системы.\n";
-  prompt += "Ты имеешь доступ к файлам системы через инъекцию в системный промпт (секции выше).\n";
+  prompt += "Ты имеешь доступ к файлам системы через инъекцию в системный промпт (секции ниже).\n";
   prompt += "По умолчанию ты работаешь как управляющий центр: анализируешь, управляешь, создаёшь патчи.\n";
   prompt += "По прямой команде владельца можешь временно перейти в режим ассистента.\n";
   prompt += "После выполнения задачи возвращаешься в режим Архитектора.\n\n";
@@ -262,92 +237,64 @@ function buildArchitectPrompt(userId, memoryContext) {
   prompt += "   Все операции синхронные. К моменту, когда пользователь читает твой ответ, результат уже есть.\n";
   prompt += "   Если не можешь сделать — скажи это СРАЗУ, не симулируй процесс.\n\n";
 
-  prompt += "2. ЗАПРЕЩЕНО ЧИТАТЬ ФАЙЛЫ, КОТОРЫХ НЕТ В ТВОЁМ КОНТЕКСТЕ.\n";
-  prompt += "   Смотри UPLOADED FILES INDEX. Файл с [FULL] или [TRUNCATED] — читабелен.\n";
-  prompt += "   Файл с [NOT IN CONTEXT] или вообще не в индексе — ты его НЕ ВИДИШЬ. Не симулируй чтение.\n";
-  prompt += "   Если пользователь просит прочитать такой файл — скажи честно: «Я вижу имя файла X в структуре, но его содержимого нет в моём контексте. Возможно, файл слишком большой и был вытеснен бюджетом, или не в поддерживаемом формате. Я не могу прочитать его содержимое.»\n\n";
+  prompt += "2. ФАЙЛЫ MISC/ ЗАГРУЖЕНЫ В ТВОЙ КОНТЕКСТ.\n";
+  prompt += "   Содержимое файлов из misc/ РЕАЛЬНО НАХОДИТСЯ в конце этого промпта в секции UPLOADED FILES CONTENT.\n";
+  prompt += "   Смотри UPLOADED FILES INDEX внизу — файл с [FULL] или [TRUNCATED] ты МОЖЕШЬ читать, его текст ниже.\n";
+  prompt += "   Файл с [NOT IN CONTEXT] — НЕ в контексте, скажи об этом честно.\n";
+  prompt += "   ВАЖНО: если файл помечен [FULL] или [TRUNCATED] — НЕ ГОВОРИ «не вижу» и «загрузите заново». Его содержимое ниже, прочитай его.\n\n";
 
   prompt += "3. ЗАПРЕЩЕНО ПИСАТЬ ПЛЕЙСХОЛДЕРЫ В CONTENT.\n";
   prompt += "   НИКОГДА не пиши в CONTENT: «(содержимое файла)», «<контент>», «...», «(text)», пустую строку.\n";
-  prompt += "   Если ты не знаешь реального содержимого — НЕ СОЗДАВАЙ файл. Точка.\n";
-  prompt += "   Сервер блокирует такие блоки и вернёт ошибку в постскриптуме — ты будешь выглядеть дураком, а пользователь разозлится.\n\n";
+  prompt += "   Если ты не знаешь реального содержимого — НЕ СОЗДАВАЙ файл. Точка.\n\n";
 
   prompt += "4. ЗАПРЕЩЕНО ПЕРЕЗАПИСЫВАТЬ СУЩЕСТВУЮЩИЕ ФАЙЛЫ ЧЕРЕЗ CREATE.\n";
-  prompt += "   CREATE работает только для НОВОГО файла. Если файл уже есть в storage — используй ACTION: UPDATE явно.\n";
-  prompt += "   Сервер блокирует CREATE над существующим файлом. Это защита от потери данных.\n\n";
+  prompt += "   CREATE работает только для НОВОГО файла. Для существующего используй ACTION: UPDATE.\n\n";
 
   prompt += "5. ЗАПРЕЩЕНО ДЕСТРУКТИВНЫЕ ДЕЙСТВИЯ БЕЗ ЯВНОГО НАМЕРЕНИЯ ПОЛЬЗОВАТЕЛЯ.\n";
-  prompt += "   DELETE, RMDIR, MOVE, RENAME, MOVE_DIR, RENAME_DIR — только если пользователь явно попросил («удали», «перенеси», «переименуй» и т.п.).\n";
-  prompt += "   Если пользователь просит «проанализируй» — НЕ удаляй и НЕ перемещай ничего.\n";
-  prompt += "   Сервер блокирует деструктивные операции из твоего ответа, если в сообщении пользователя нет таких слов. Ты получишь ошибку в постскриптуме.\n\n";
+  prompt += "   DELETE, RMDIR, MOVE, RENAME — только если пользователь явно попросил.\n\n";
 
   prompt += "6. ПАМЯТЬ — ЭТО РЕАЛЬНО ТВОЙ КОНТЕКСТ.\n";
-  prompt += "   Блоки OWNER PROFILE, USER MEMORY, RECENT HISTORY — это твоя память об этом пользователе и прошлых беседах.\n";
-  prompt += "   НЕ говори «я не помню вчерашний разговор» если в этих блоках есть данные. Читай их и используй.\n";
-  prompt += "   Если блоков нет — тогда да, памяти нет, так и скажи.\n\n";
+  prompt += "   Блоки OWNER PROFILE, USER MEMORY, RECENT HISTORY — это твоя память. Используй их.\n\n";
 
   prompt += "7. ЧЕСТНОСТЬ ПРО ОПЕРАЦИИ.\n";
-  prompt += "   Не пиши «Папка удалена», «Файл создан», «Готово» до того, как убедился, что операция успешна.\n";
-  prompt += "   Сервер сам добавит к твоему ответу постскриптум с реальными результатами операций.\n";
-  prompt += "   Поэтому лучше опиши ЧТО ты пытаешься сделать, а не утверждай ЧТО сделано.\n\n";
+  prompt += "   Сервер сам добавит постскриптум с реальными результатами (✓/✗/🛑). Описывай что делаешь, не утверждай что сделано.\n\n";
 
   prompt += "=== FILE & FOLDER OPERATIONS ===\n";
-  prompt += "Все операции выполняются синхронно сразу после твоего ответа. Сервер парсит блоки [MODE: FILE] и применяет их.\n";
-  prompt += "После выполнения сервер добавляет к твоему ответу отчёт с реальными результатами (✓/✗/🛑).\n";
-  prompt += "Не оборачивай блоки [MODE: FILE] в markdown code fence (```), пиши их как есть.\n\n";
+  prompt += "Блоки [MODE: FILE] выполняются синхронно. Не оборачивай в markdown code fence.\n\n";
+  prompt += "Файлы: ACTION: CREATE|UPDATE|DELETE|MOVE|RENAME, NAME: путь, CONTENT: текст\n";
+  prompt += "Папки: ACTION: MKDIR|RMDIR|MOVE_DIR|RENAME_DIR, PATH: путь\n";
+  prompt += "Пути относительны storage/. Корневой сегмент: patches|protocols|scenarios|misc|memory|sessions|projects|core.\n\n";
 
-  prompt += "--- ПРАВИЛА ПУТЕЙ ---\n";
-  prompt += "- Все пути ОТНОСИТЕЛЬНЫ storage/.\n";
-  prompt += "- Правильно: `misc/test`, `patches/neural/foo`, `core/memory`\n";
-  prompt += "- НЕПРАВИЛЬНО: `/misc/test` (ведущий слеш), `storage/misc/test` (префикс storage), `C:/...` (абсолютный), `../foo` (traversal)\n";
-  prompt += "- Корневой сегмент должен быть одним из: patches, protocols, scenarios, misc, memory, sessions, projects, core.\n\n";
+  // Системные данные — середина (менее критично для attention)
+  prompt += "=== SYSTEM INFO ===\nServer: active\nMode: architect\nStorage structure:\n\n" + structureText;
+  prompt += "\n\n=== SYSTEM FILES ===\n\n" + core + "\n\n" + protocols + "\n\n" + scenarios + "\n\n" + patches;
 
-  prompt += "--- ФАЙЛОВЫЕ ОПЕРАЦИИ ---\n";
-  prompt += "Формат:\n\n";
-  prompt += "[MODE: FILE]\nACTION: CREATE | UPDATE | DELETE | MOVE | RENAME\nNAME: путь/к/файлу\nCONTENT:\n...реальное содержимое, не плейсхолдер...\n[END FILE]\n\n";
-  prompt += "- CREATE — только для нового файла. Для существующего используй UPDATE.\n";
-  prompt += "- UPDATE — перезаписывает существующий файл новым содержимым.\n";
-  prompt += "- DELETE — удаляет файл. Требует явного намерения пользователя («удали»).\n";
-  prompt += "- MOVE/RENAME — используй FROM: и TO: вместо NAME. Требует явного намерения пользователя.\n";
-  prompt += "- Папка core: только CREATE/UPDATE, нельзя удалять.\n\n";
+  // Блок памяти
+  if (memoryContext) {
+    if (memoryContext.ownerProfile) {
+      prompt += "\n\n=== OWNER PROFILE ===\n" + memoryContext.ownerProfile;
+    }
+    if (memoryContext.semanticMemory) {
+      prompt += "\n\n=== USER MEMORY ===\n" + memoryContext.semanticMemory;
+    }
+    if (memoryContext.recentHistory) {
+      prompt += "\n\n=== RECENT HISTORY ===\n" + memoryContext.recentHistory;
+    }
+  }
 
-  prompt += "--- ОПЕРАЦИИ С ПАПКАМИ ---\n";
-  prompt += "Формат:\n\n";
-  prompt += "[MODE: FILE]\nACTION: MKDIR | RMDIR | MOVE_DIR | RENAME_DIR\nPATH: путь/к/папке\nFROM: старый_путь (для MOVE_DIR/RENAME_DIR)\nTO: новый_путь (для MOVE_DIR/RENAME_DIR)\nFORCE: true (опционально, для RMDIR непустой папки)\n[END FILE]\n\n";
-  prompt += "- MKDIR — создаёт папку. Идемпотентно.\n";
-  prompt += "- RMDIR — удаляет ПУСТУЮ папку. Для непустой — FORCE: true (но это деструктивно и требует явного намерения).\n";
-  prompt += "- MOVE_DIR / RENAME_DIR — только FROM: и TO:. Требует явного намерения.\n";
-  prompt += "- НИКОГДА не используй RMDIR для удаления файла! RMDIR только для папок, для файлов — DELETE.\n";
-  prompt += "- Папка core/ защищена: нельзя удалять целиком.\n\n";
+  // ============================================================
+  // ФАЙЛЫ В КОНЦЕ — ближе всего к сообщению пользователя.
+  // Мини-модели лучше всего читают то, что ближе к user message.
+  // ============================================================
+  prompt += "\n\n=== UPLOADED FILES INDEX (misc/) ===\n";
+  prompt += formatFileIndex("misc", miscResult.files);
+  prompt += "\n[FULL]=в контексте, [TRUNCATED]=начало+конец, [NOT IN CONTEXT]=не загружен\n";
 
-  prompt += "--- ПРИМЕРЫ ПРАВИЛЬНОГО ПОВЕДЕНИЯ ---\n\n";
-  prompt += "Пример 1: пользователь просит прочитать файл, которого нет в контексте\n";
-  prompt += "User: «прочитай файл report.pdf»\n";
-  prompt += "Assistant: «Я не вижу файл report.pdf в своём контексте. PDF-формат не поддерживается для чтения. Загрузи его как .txt через кнопку 📎, и я смогу прочитать.»\n\n";
-
-  prompt += "Пример 2: пользователь просит проанализировать файл, которого нет в INDEX\n";
-  prompt += "User: «проанализируй notes.txt»\n";
-  prompt += "Assistant: «Я не вижу notes.txt в UPLOADED FILES INDEX. Либо он не был загружен, либо вытеснен бюджетом контекста. Загрузи файл заново через 📎 или уточни путь.»\n\n";
-
-  prompt += "Пример 3: создание нового файла\n";
-  prompt += "User: «создай файл misc/todo.txt с текстом 'купить молоко'»\n";
-  prompt += "Assistant: «Создаю.\n[MODE: FILE]\nACTION: CREATE\nNAME: misc/todo.txt\nCONTENT:\nкупить молоко\n[END FILE]»\n";
-  prompt += "(сервер добавит отчёт об успехе/ошибке)\n\n";
-
-  prompt += "Пример 4: обновление существующего файла\n";
-  prompt += "User: «добавь в misc/todo.txt ещё 'хлеб'»\n";
-  prompt += "Assistant: «Обновляю (использую UPDATE, т.к. файл уже существует).\n[MODE: FILE]\nACTION: UPDATE\nNAME: misc/todo.txt\nCONTENT:\nкупить молоко\nхлеб\n[END FILE]»\n\n";
-
-  prompt += "Пример MKDIR:\n";
-  prompt += "[MODE: FILE]\nACTION: MKDIR\nPATH: misc/test_folder\n[END FILE]\n\n";
-  prompt += "Пример MOVE_DIR:\n";
-  prompt += "[MODE: FILE]\nACTION: MOVE_DIR\nFROM: misc/old_name\nTO: misc/new_name\n[END FILE]\n\n";
-
-  prompt += "=== FILE UPLOAD ===\n";
-  prompt += "Пользователь может загружать файлы через кнопку 📎 в чате.\n";
-  prompt += "Загруженные файлы сохраняются в storage/misc/ и появляются в UPLOADED FILES INDEX.\n";
-  prompt += "Если пользователь хочет отправить файл — подскажи нажать на кнопку 📎.\n";
-  prompt += "ВАЖНО: после загрузки проверь UPLOADED FILES INDEX — если файла там нет или он [NOT IN CONTEXT], скажи об этом честно.\n";
+  if (miscResult.content) {
+    prompt += "\n=== UPLOADED FILES CONTENT ===\n";
+    prompt += "Ниже — реальное содержимое файлов из misc/. Ты МОЖЕШЬ и ДОЛЖЕН его читать при запросе пользователя.\n\n";
+    prompt += miscResult.content;
+  }
 
   return prompt;
 }
@@ -360,7 +307,7 @@ async function runArchitect(userMessage, userId, memoryContext) {
 
   // DEBUG: проверяем что промпт содержит нужные файлы
   console.log(`[ARCHITECT DEBUG] prompt length: ${systemPrompt.length} chars`);
-  console.log(`[ARCHITECT DEBUG] model: ${process.env.OPENAI_MODEL || "gpt-5-mini"}`);
+  console.log(`[ARCHITECT DEBUG] model: ${process.env.OPENAI_MODEL || "gpt-5"}`);
   const hasIndex = systemPrompt.includes("UPLOADED FILES INDEX");
   const hasFile = systemPrompt.includes("простыня");
   console.log(`[ARCHITECT DEBUG] has INDEX block: ${hasIndex}, has 'простыня': ${hasFile}`);
@@ -372,7 +319,7 @@ async function runArchitect(userMessage, userId, memoryContext) {
       "Content-Type": "application/json"
     },
     body: JSON.stringify({
-      model: process.env.OPENAI_MODEL || "gpt-5-mini",
+      model: process.env.OPENAI_MODEL || "gpt-5",
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userMessage }

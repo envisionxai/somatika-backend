@@ -116,7 +116,7 @@ assistant: ${assistantReply}
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        model: process.env.OPENAI_MODEL || "gpt-5-mini",
+        model: process.env.OPENAI_MODEL || "gpt-5",
         messages: [
           { role: "user", content: prompt }
         ],

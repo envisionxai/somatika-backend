@@ -45,7 +45,7 @@ async function callAI(message, project = "custom", scenario = "NORMAL") {
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        model: process.env.OPENAI_MODEL || "gpt-5-mini",
+        model: process.env.OPENAI_MODEL || "gpt-5",
         messages: [
           { role: "system", content: systemPrompt },
           { role: "user", content: message }
