@@ -207,9 +207,9 @@ function buildArchitectPrompt(userId, memoryContext) {
   const scenarios = readFolder("scenarios");
   const patches = readFolder("patches");
 
-  // Бюджет снижен с 80K→30K, per-file с 12K→5K — чтобы промпт не превышал ~40K.
-  // Мини-модели теряют информацию из середины длинных промптов ("lost in the middle").
-  const miscResult = readFolderRecursive("misc", { maxFileChars: 5000, maxTotalChars: 30000 });
+  // gpt-5 + async-паттерн — таймаут не проблема, даём максимальный бюджет.
+  // Per-file 50K покрывает файлы до ~100KB целиком. Total 200K — весь misc/.
+  const miscResult = readFolderRecursive("misc", { maxFileChars: 50000, maxTotalChars: 200000 });
 
   const storageStructure = scanStorageStructure();
   const structureText = Object.entries(storageStructure)
